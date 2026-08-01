@@ -50,11 +50,15 @@ Or run the bundled script:
 | Command | Purpose |
 |---|---|
 | `synapse init [dir] [name]` | Create workspace (datasources, pipes, token) |
+| `synapse build --root <dir>` | Validate workspace (`tb build` analog) |
+| `synapse workspace --root <dir>` | List pipes + types |
+| `synapse endpoint --root <dir>` | List published endpoints |
+| `synapse token show\|create [name]` | Admin / scoped tokens |
 | `synapse dev --root <dir> --port <n>` | Serve HTTP + MCP |
 | `synapse ingest <ds> <file.ndjson> --root <dir> [--replace]` | Append (or replace) events |
 | `synapse remember "<text>" --root <dir> --run-id <id>` | Write a Mind claim |
 | `synapse pipe run <name> --root <dir> --run-id <id>` | Run a pipe offline |
-| `synapse test --root <dir>` | Verify recall / plan / route / metrics / blast / dispute |
+| `synapse test --root <dir>` | Verify build + verbs + copy/sink |
 
 ## Product surface
 
@@ -75,6 +79,12 @@ Default pipes:
 | `find_contradictions` | `/v1/dispute` | Opposing Mind claims |
 
 Auth is opt-in: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` from `.synapse/token`.
+
+Pipe types (Tinybird-shaped): `endpoint` · `materialized` · `copy` · `sink`  
+Formats: `/v1/pipes/{name}.json|.ndjson|.csv` or `?format=`  
+Query API: `POST /v1/query` with `{ datasource, where, limit, offset }`
+
+Full Tinybird mapping: [docs/tinybird-parity.md](docs/tinybird-parity.md).
 
 ## MCP
 

@@ -8,6 +8,9 @@ pub const builtin_datasources = [_][]const u8{
     "tool_calls",
     "llm_spans",
     "memory_writes",
+    "plan_steps",
+    "beliefs",
+    "synapse_ops_log",
 };
 
 pub const Store = struct {

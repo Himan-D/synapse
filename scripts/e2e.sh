@@ -60,4 +60,18 @@ curl -sf -X POST "http://127.0.0.1:8787/v1/remember" \
   -d '{"run_id":"run_demo","text":"e2e remembered claim","confidence":0.85}'
 echo
 
+echo "==> metrics CSV format"
+curl -sf "http://127.0.0.1:8787/v1/pipes/tool_failure_rate.csv?run_id=run_demo" | head -c 200
+echo
+
+echo "==> query API"
+curl -sf -X POST "http://127.0.0.1:8787/v1/query" \
+  -H "content-type: application/json" \
+  -d '{"datasource":"harness_events","where":{"run_id":"run_demo"},"limit":2}' | head -c 300
+echo
+
+echo "==> endpoints list"
+curl -sf "http://127.0.0.1:8787/v1/endpoints" | head -c 300
+echo
+
 echo "==> e2e OK"

@@ -270,17 +270,21 @@ One write path → memory **and** metrics. No dual instrumentation.
 | Capability | Status |
 |---|---|
 | Workspace · datasources · NDJSON ingest | **Shipped** |
-| Pipe IR: filter / aggregate / materialize / project | **Shipped** |
-| recall · metrics · impact | **Shipped** |
-| plan · route · remember · dispute | **Shipped** |
+| Pipe IR: filter / aggregate / materialize / project / copy / sink | **Shipped** |
+| Pipe kinds: endpoint · materialized · copy · sink | **Shipped** |
+| recall · metrics · impact · plan · route · remember · dispute | **Shipped** |
+| Response formats json / ndjson / csv | **Shipped** |
+| Query API (`POST /v1/query`) | **Shipped** |
+| Service datasource `synapse_ops_log` | **Shipped** |
+| `synapse build` / `workspace` / `endpoint` / `token` | **Shipped** |
 | HTTP + MCP (full verb surface) | **Shipped** |
-| CLI init/dev/ingest/remember/pipe/test | **Shipped** |
 | Dynamic pipe directory scan | **Shipped** |
 | Bearer auth (`SYNAPSE_REQUIRE_AUTH=1`) | **Shipped** |
 | Python SDK (`sdk/python`) | **Shipped** |
 | Confidence-weighted recall | **Shipped** |
+| Tinybird parity matrix | [docs/tinybird-parity.md](docs/tinybird-parity.md) |
 | embed hybrid retrieval | Interface + stub |
-| Cloud multi-tenant · SQL pipes · UI | Roadmap |
+| Cloud multi-tenant · SQL pipes · UI · JWT | Roadmap |
 | Hypergraphs · CRDT merge · GNN | Research |
 
 ---

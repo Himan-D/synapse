@@ -13,6 +13,21 @@ pub const PipeNodeType = enum {
     aggregate,
     materialize_graph,
     project,
+    copy,
+    sink,
+};
+
+/// Tinybird pipe output kinds.
+pub const PipeKind = enum {
+    endpoint,
+    materialized,
+    copy,
+    sink,
+    generic,
+
+    pub fn fromString(s: []const u8) PipeKind {
+        return std.meta.stringToEnum(PipeKind, s) orelse .endpoint;
+    }
 };
 
 pub const AggregateOp = enum { count, rate };
@@ -35,17 +50,26 @@ pub const PipeNode = struct {
     success_field: ?[]const u8 = null,
     project_op: ProjectOp = .passthrough,
     budget_tokens: usize = 4000,
+    target_datasource: ?[]const u8 = null,
+    sink_path: ?[]const u8 = null,
 };
 
 pub const Pipe = struct {
     allocator: Allocator,
     name: []const u8,
+    kind: PipeKind = .endpoint,
+    description: ?[]const u8 = null,
     nodes: std.ArrayList(PipeNode) = .empty,
     endpoint_path: ?[]const u8 = null,
     endpoint_params: std.ArrayList([]const u8) = .empty,
+    target_datasource: ?[]const u8 = null,
+    sink_path: ?[]const u8 = null,
 
     pub fn deinit(self: *Pipe) void {
         self.allocator.free(self.name);
+        if (self.description) |d| self.allocator.free(d);
+        if (self.target_datasource) |t| self.allocator.free(t);
+        if (self.sink_path) |p| self.allocator.free(p);
         for (self.nodes.items) |*n| {
             if (n.datasource) |ds| self.allocator.free(ds);
             var wit = n.where.iterator();
@@ -57,6 +81,8 @@ pub const Pipe = struct {
             n.layers.deinit(self.allocator);
             if (n.group_by) |g| self.allocator.free(g);
             if (n.success_field) |sf| self.allocator.free(sf);
+            if (n.target_datasource) |t| self.allocator.free(t);
+            if (n.sink_path) |p| self.allocator.free(p);
         }
         self.nodes.deinit(self.allocator);
         if (self.endpoint_path) |p| self.allocator.free(p);
@@ -94,6 +120,12 @@ pub fn parsePipe(allocator: Allocator, bytes: []const u8) !Pipe {
     };
     errdefer pipe.deinit();
 
+    if (obj.get("type")) |t| pipe.kind = PipeKind.fromString(t.string);
+    if (obj.get("description")) |d| pipe.description = try allocator.dupe(u8, d.string);
+    if (obj.get("target_datasource")) |t| pipe.target_datasource = try allocator.dupe(u8, t.string);
+    if (obj.get("datasource")) |t| pipe.target_datasource = try allocator.dupe(u8, t.string); // Tinybird MATERIALIZED alias
+    if (obj.get("sink_path")) |p| pipe.sink_path = try allocator.dupe(u8, p.string);
+
     if (obj.get("endpoint")) |ep_v| {
         const ep = ep_v.object;
         if (ep.get("path")) |p| pipe.endpoint_path = try allocator.dupe(u8, p.string);
@@ -102,6 +134,8 @@ pub fn parsePipe(allocator: Allocator, bytes: []const u8) !Pipe {
                 try pipe.endpoint_params.append(allocator, try allocator.dupe(u8, p.string));
             }
         }
+        // Declaring endpoint implies TYPE ENDPOINT when unset/generic default.
+        if (pipe.kind == .endpoint or pipe.kind == .generic) pipe.kind = .endpoint;
     }
 
     const nodes_v = obj.get("nodes") orelse return error.MissingField;
@@ -135,6 +169,8 @@ pub fn parsePipe(allocator: Allocator, bytes: []const u8) !Pipe {
         }
         if (nobj.get("success_field")) |sf| node.success_field = try allocator.dupe(u8, sf.string);
         if (nobj.get("budget_tokens")) |bt| node.budget_tokens = @intCast(bt.integer);
+        if (nobj.get("target_datasource")) |t| node.target_datasource = try allocator.dupe(u8, t.string);
+        if (nobj.get("sink_path")) |p| node.sink_path = try allocator.dupe(u8, p.string);
 
         try pipe.nodes.append(allocator, node);
     }
@@ -245,6 +281,38 @@ pub fn execute(
                         last_json = json;
                     },
                 }
+            },
+            .copy => {
+                const target = node.target_datasource orelse pipe.target_datasource orelse return error.MissingTargetDatasource;
+                const evs = current orelse &.{};
+                var n: usize = 0;
+                for (evs) |ev| {
+                    try store.ingestLine(target, ev.raw_json);
+                    n += 1;
+                }
+                try store.persistDatasource(target);
+                if (last_json) |j| allocator.free(j);
+                last_json = try std.fmt.allocPrint(allocator, "{{\"copied\":{d},\"target\":{f}}}", .{ n, std.json.fmt(target, .{}) });
+            },
+            .sink => {
+                const path = node.sink_path orelse pipe.sink_path orelse return error.MissingSinkPath;
+                var tmp_body: ?[]u8 = null;
+                defer if (tmp_body) |b| allocator.free(b);
+                const body: []const u8 = if (last_json) |j| j else blk: {
+                    const evs = current orelse &.{};
+                    tmp_body = try eventsToJson(allocator, evs);
+                    break :blk tmp_body.?;
+                };
+                if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+                    try std.Io.Dir.cwd().createDirPath(store.io, path[0..slash]);
+                }
+                try std.Io.Dir.cwd().writeFile(store.io, .{ .sub_path = path, .data = body });
+                const nbytes = body.len;
+                if (last_json) |j| {
+                    allocator.free(j);
+                    last_json = null;
+                }
+                last_json = try std.fmt.allocPrint(allocator, "{{\"sunk\":true,\"path\":{f},\"bytes\":{d}}}", .{ std.json.fmt(path, .{}), nbytes });
             },
         }
     }

@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const workspace_mod = @import("../core/workspace.zig");
 const mcp_mod = @import("mcp.zig");
+const format_mod = @import("../core/format.zig");
+const query_mod = @import("../core/query.zig");
 
 pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, port: u16) !void {
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -74,11 +76,24 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         return;
     }
 
+    if (method == .GET and std.mem.eql(u8, path, "/v1/endpoints")) {
+        const json = try ws.listEndpointsJson(allocator);
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/events/")) {
         const ds = path["/v1/events/".len..];
         const body = try readBody(allocator, &request);
         defer allocator.free(body);
         const n = try ws.store.ingestNdjson(ds, body);
+        ws.runMaterializedPipes() catch {};
+        ws.logOp("ingest", ds, "ok");
         var resp_buf: [64]u8 = undefined;
         const resp = try std.fmt.bufPrint(&resp_buf, "{{\"ingested\":{d}}}\n", .{n});
         try request.respond(resp, .{
@@ -87,6 +102,53 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
             },
         });
         return;
+    }
+
+    if (method == .POST and std.mem.eql(u8, path, "/v1/query")) {
+        const body = try readBody(allocator, &request);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const ds = obj.get("datasource").?.string;
+        var where: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer {
+            var wit = where.iterator();
+            while (wit.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            where.deinit(allocator);
+        }
+        if (obj.get("where")) |w| {
+            var it = w.object.iterator();
+            while (it.next()) |e| {
+                try where.put(allocator, try allocator.dupe(u8, e.key_ptr.*), try allocator.dupe(u8, e.value_ptr.string));
+            }
+        }
+        const limit: usize = if (obj.get("limit")) |l| switch (l) {
+            .integer => |i| @intCast(i),
+            else => 100,
+        } else 100;
+        const offset: usize = if (obj.get("offset")) |o| switch (o) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        } else 0;
+        const json = try query_mod.runQuery(allocator, &ws.store, ds, where, limit, offset);
+        defer allocator.free(json);
+        ws.logOp("query", ds, "ok");
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/datasources/") and std.mem.endsWith(u8, path, "/data")) {
+        // /v1/datasources/{name}/data?...
+        const mid = path["/v1/datasources/".len .. path.len - "/data".len];
+        return runDatasourceQuery(allocator, &request, ws, mid, target);
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) {
@@ -105,6 +167,7 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         } else 0.8;
         const json = try ws.remember(run_id, agent_id, text, confidence);
         defer allocator.free(json);
+        ws.logOp("remember", run_id, "ok");
         try request.respond(json, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
@@ -114,27 +177,28 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
     }
 
     if (method == .GET and std.mem.startsWith(u8, path, "/v1/pipes/")) {
-        const name = path["/v1/pipes/".len..];
-        return runAlias(allocator, &request, ws, name, target);
+        const tail = path["/v1/pipes/".len..];
+        const split = format_mod.splitNameFormat(tail);
+        return runAlias(allocator, &request, ws, split.name, target, split.format);
     }
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/recall")) {
-        return runAlias(allocator, &request, ws, "recall_context", target);
+        return runAlias(allocator, &request, ws, "recall_context", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/tool_failure_rate")) {
-        return runAlias(allocator, &request, ws, "tool_failure_rate", target);
+        return runAlias(allocator, &request, ws, "tool_failure_rate", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/impact")) {
-        return runAlias(allocator, &request, ws, "blast_radius", target);
+        return runAlias(allocator, &request, ws, "blast_radius", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/plan")) {
-        return runAlias(allocator, &request, ws, "plan_goal", target);
+        return runAlias(allocator, &request, ws, "plan_goal", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/route")) {
-        return runAlias(allocator, &request, ws, "route_query", target);
+        return runAlias(allocator, &request, ws, "route_query", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/dispute")) {
-        return runAlias(allocator, &request, ws, "find_contradictions", target);
+        return runAlias(allocator, &request, ws, "find_contradictions", target, null);
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) {
@@ -163,11 +227,11 @@ fn pathOnlyStr(target: []const u8) []const u8 {
     return target;
 }
 
-fn runAlias(
+fn runDatasourceQuery(
     allocator: Allocator,
     request: *std.http.Server.Request,
     ws: *workspace_mod.Workspace,
-    pipe_name: []const u8,
+    ds: []const u8,
     target: []const u8,
 ) !void {
     const qmark = std.mem.indexOfScalar(u8, target, '?');
@@ -182,6 +246,59 @@ fn runAlias(
         params.deinit(allocator);
     }
     try parseQuery(allocator, query, &params);
+
+    var where: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var it = where.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        where.deinit(allocator);
+    }
+    var it = params.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, "limit") or std.mem.eql(u8, e.key_ptr.*, "offset") or std.mem.eql(u8, e.key_ptr.*, "format")) continue;
+        try where.put(allocator, try allocator.dupe(u8, e.key_ptr.*), try allocator.dupe(u8, e.value_ptr.*));
+    }
+    const limit = query_mod.parseLimit(params, 100);
+    const offset = query_mod.parseOffset(params);
+    const json = try query_mod.runQuery(allocator, &ws.store, ds, where, limit, offset);
+    defer allocator.free(json);
+    ws.logOp("query", ds, "ok");
+    try request.respond(json, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    });
+}
+
+fn runAlias(
+    allocator: Allocator,
+    request: *std.http.Server.Request,
+    ws: *workspace_mod.Workspace,
+    pipe_name: []const u8,
+    target: []const u8,
+    path_format: ?format_mod.Format,
+) !void {
+    const qmark = std.mem.indexOfScalar(u8, target, '?');
+    const query = if (qmark) |i| target[i + 1 ..] else "";
+    var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var it = params.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        params.deinit(allocator);
+    }
+    try parseQuery(allocator, query, &params);
+
+    var format = path_format orelse format_mod.Format.json;
+    if (params.get("format")) |f| {
+        if (format_mod.Format.fromString(f)) |ff| format = ff;
+    }
+
     var result = ws.runPipe(pipe_name, params) catch {
         try request.respond("{\"error\":\"pipe_not_found\"}\n", .{
             .status = .not_found,
@@ -192,9 +309,19 @@ fn runAlias(
         return;
     };
     defer result.deinit();
-    try request.respond(result.json, .{
+
+    const limit_opt: ?usize = if (params.get("limit") != null) query_mod.parseLimit(params, 100) else null;
+    const offset = query_mod.parseOffset(params);
+    const paged = try query_mod.applyPagination(allocator, result.json, limit_opt, offset);
+    defer allocator.free(paged);
+
+    const body = try format_mod.convert(allocator, paged, format);
+    defer allocator.free(body);
+
+    ws.logOp("endpoint", pipe_name, @tagName(format));
+    try request.respond(body, .{
         .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "content-type", .value = format.contentType() },
         },
     });
 }
@@ -206,7 +333,6 @@ fn parseQuery(allocator: Allocator, query: []const u8, params: *std.StringHashMa
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = try allocator.dupe(u8, pair[0..eq]);
         const val_raw = pair[eq + 1 ..];
-        // minimal URL decode for %20 and +
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(allocator);
         var i: usize = 0;

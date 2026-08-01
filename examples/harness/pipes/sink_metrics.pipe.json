@@ -1,0 +1,11 @@
+{
+  "name": "sink_metrics",
+  "type": "sink",
+  "description": "Export tool failure metrics to a local file",
+  "sink_path": "examples/harness/.synapse/exports/tool_failure_rate.json",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "tool_call" } },
+    { "type": "aggregate", "op": "rate", "group_by": "name", "success_field": "ok" },
+    { "type": "sink", "sink_path": "examples/harness/.synapse/exports/tool_failure_rate.json" }
+  ]
+}

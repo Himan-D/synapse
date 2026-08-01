@@ -1,0 +1,10 @@
+{
+  "name": "materialize_memory",
+  "type": "materialized",
+  "description": "On ingest, copy memory_write events into memory_writes",
+  "target_datasource": "memory_writes",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "type": "memory_write" } },
+    { "type": "copy", "target_datasource": "memory_writes" }
+  ]
+}

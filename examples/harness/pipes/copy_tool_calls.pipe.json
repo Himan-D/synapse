@@ -1,0 +1,10 @@
+{
+  "name": "copy_tool_calls",
+  "type": "copy",
+  "description": "Copy tool_call events into tool_calls datasource",
+  "target_datasource": "tool_calls",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "type": "tool_call" } },
+    { "type": "copy", "target_datasource": "tool_calls" }
+  ]
+}

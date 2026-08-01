@@ -98,6 +98,34 @@ class Synapse:
     def dispute(self, run_id: str = "", **extra: Any) -> dict:
         return self._request("GET", "/v1/dispute", query={"run_id": run_id, **extra})
 
+    def endpoints(self) -> dict:
+        return self._request("GET", "/v1/endpoints")
+
+    def query(
+        self,
+        datasource: str,
+        *,
+        where: Optional[Mapping[str, Any]] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        payload = {
+            "datasource": datasource,
+            "where": dict(where or {}),
+            "limit": limit,
+            "offset": offset,
+        }
+        return self._request(
+            "POST",
+            "/v1/query",
+            body=json.dumps(payload).encode("utf-8"),
+            content_type="application/json",
+        )
+
+    def pipe(self, name: str, *, format: str = "json", **params: Any) -> Any:
+        path = f"/v1/pipes/{name}.{format}" if format != "json" else f"/v1/pipes/{name}"
+        return self._request("GET", path, query=params)
+
     def tool_call_event(
         self,
         run_id: str,

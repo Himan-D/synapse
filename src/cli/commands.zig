@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const workspace_mod = @import("../core/workspace.zig");
 const http_mod = @import("../server/http.zig");
+const validate_mod = @import("../core/validate.zig");
 
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (args.len < 2) {
@@ -19,6 +20,36 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const name = if (args.len >= 4) args[3] else "synapse-workspace";
         try workspace_mod.initWorkspace(allocator, io, root, name);
         std.log.info("initialized workspace at {s}", .{root});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "build")) {
+        const root = flagOr(args, "--root", ".");
+        var report = try validate_mod.buildWorkspace(allocator, io, root);
+        defer report.deinit();
+        std.debug.print("{s}\n", .{report.json});
+        if (!report.ok) return error.BuildFailed;
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "workspace")) {
+        const root = flagOr(args, "--root", ".");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.listPipesJson(allocator);
+        defer allocator.free(json);
+        std.debug.print("{s}\n", .{json});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "endpoint") or std.mem.eql(u8, cmd, "endpoints")) {
+        const root = flagOr(args, "--root", ".");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.listEndpointsJson(allocator);
+        defer allocator.free(json);
+        std.debug.print("{s}\n", .{json});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "token")) {
+        try runToken(allocator, io, args);
         return;
     }
     if (std.mem.eql(u8, cmd, "dev")) {
@@ -41,6 +72,8 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const body = try Io.Dir.cwd().readFileAlloc(io, file, allocator, .unlimited);
         defer allocator.free(body);
         const n = try ws.store.ingestNdjsonOpts(ds, body, replace);
+        ws.runMaterializedPipes() catch {};
+        ws.logOp("ingest", ds, "cli");
         std.log.info("ingested {d} events into {s} (replace={any})", .{ n, ds, replace });
         return;
     }
@@ -94,6 +127,90 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
     return error.Usage;
 }
 
+fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) return error.Usage;
+    const sub = args[2];
+    const root = flagOr(args, "--root", ".");
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
+    const tokens_path = try std.fmt.allocPrint(allocator, "{s}/.synapse/tokens.json", .{root});
+    defer allocator.free(tokens_path);
+
+    if (std.mem.eql(u8, sub, "show") or std.mem.eql(u8, sub, "list")) {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("{");
+        if (Io.Dir.cwd().readFileAlloc(io, token_path, allocator, .unlimited)) |tok| {
+            defer allocator.free(tok);
+            try aw.writer.print("\"admin_token\":{f}", .{std.json.fmt(std.mem.trim(u8, tok, " \t\r\n"), .{})});
+        } else |_| {
+            try aw.writer.writeAll("\"admin_token\":null");
+        }
+        try aw.writer.writeAll(",\"tokens\":");
+        if (Io.Dir.cwd().readFileAlloc(io, tokens_path, allocator, .unlimited)) |bytes| {
+            defer allocator.free(bytes);
+            try aw.writer.writeAll(bytes);
+        } else |_| {
+            try aw.writer.writeAll("[]");
+        }
+        try aw.writer.writeAll("}\n");
+        std.debug.print("{s}", .{aw.written()});
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "create")) {
+        const name = if (args.len >= 4) args[3] else "api";
+        const scope = flagOr(args, "--scope", "PIPES:READ");
+        var rand_buf: [16]u8 = undefined;
+        const seed: u64 = @intCast(@max(Io.Clock.real.now(io).toSeconds(), 0));
+        var prng = std.Random.DefaultPrng.init(seed ^ @as(u64, @intCast(name.len * 2654435761)));
+        prng.random().bytes(&rand_buf);
+        const hex = std.fmt.bytesToHex(rand_buf, .lower);
+        const token = try std.fmt.allocPrint(allocator, "p.{s}", .{&hex});
+        defer allocator.free(token);
+
+        // Load existing tokens array or start empty.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("[");
+        var first = true;
+        if (Io.Dir.cwd().readFileAlloc(io, tokens_path, allocator, .unlimited)) |bytes| {
+            defer allocator.free(bytes);
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch null;
+            if (parsed) |*p| {
+                defer p.deinit();
+                if (p.value == .array) {
+                    for (p.value.array.items) |item| {
+                        if (!first) try aw.writer.writeAll(",");
+                        first = false;
+                        try std.json.Stringify.value(item, .{}, &aw.writer);
+                    }
+                }
+            }
+        } else |_| {}
+        if (!first) try aw.writer.writeAll(",");
+        try aw.writer.print(
+            \\{{"name":{f},"token":{f},"scopes":[{f}]}}
+        ,
+            .{ std.json.fmt(name, .{}), std.json.fmt(token, .{}), std.json.fmt(scope, .{}) },
+        );
+        try aw.writer.writeAll("]");
+
+        // ensure .synapse exists
+        const syn_dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse", .{root});
+        try Io.Dir.cwd().createDirPath(io, syn_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = tokens_path, .data = aw.written() });
+        std.debug.print("{{\"created\":true,\"name\":{f},\"token\":{f},\"scopes\":[{f}]}}\n", .{
+            std.json.fmt(name, .{}),
+            std.json.fmt(token, .{}),
+            std.json.fmt(scope, .{}),
+        });
+        return;
+    }
+
+    return error.Usage;
+}
+
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
     return false;
@@ -112,10 +229,14 @@ fn flagOr(args: []const []const u8, flag: []const u8, default: []const u8) []con
 
 fn printHelp() !void {
     const help =
-        \\synapse — Tinybird for AI harnesses (full product surface)
+        \\synapse — Tinybird for AI harnesses
         \\
         \\Usage:
         \\  synapse init [dir] [name]
+        \\  synapse build --root <dir>
+        \\  synapse workspace --root <dir>
+        \\  synapse endpoint --root <dir>
+        \\  synapse token show|create [name] --root <dir> [--scope SCOPE]
         \\  synapse dev --root <dir> --port <port>
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
@@ -125,11 +246,21 @@ fn printHelp() !void {
         \\Env:
         \\  SYNAPSE_REQUIRE_AUTH=1   enforce Bearer token from .synapse/token
         \\
+        \\See docs/tinybird-parity.md for Tinybird feature mapping.
+        \\
     ;
     std.debug.print("{s}", .{help});
 }
 
 fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
+    var report = try validate_mod.buildWorkspace(allocator, io, root);
+    defer report.deinit();
+    if (!report.ok) {
+        std.log.err("build failed: {s}", .{report.json});
+        return error.BuildFailed;
+    }
+    std.log.info("build OK", .{});
+
     var ws = try workspace_mod.Workspace.load(allocator, io, root);
     defer ws.deinit();
 
@@ -139,6 +270,7 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
         if (Io.Dir.cwd().readFileAlloc(io, sample_path, allocator, .unlimited)) |body| {
             defer allocator.free(body);
             _ = try ws.store.ingestNdjson("harness_events", body);
+            ws.runMaterializedPipes() catch {};
         } else |_| {}
     }
 
@@ -182,6 +314,20 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
         defer dispute.deinit();
         if (std.mem.indexOf(u8, dispute.json, "disputes") == null) return error.DisputeFailed;
         std.log.info("find_contradictions OK ({d} bytes)", .{dispute.json.len});
+    }
+
+    if (ws.getPipe("copy_tool_calls")) |_| {
+        var copy = try ws.runPipe("copy_tool_calls", params);
+        defer copy.deinit();
+        if (std.mem.indexOf(u8, copy.json, "copied") == null) return error.CopyFailed;
+        std.log.info("copy_tool_calls OK ({d} bytes)", .{copy.json.len});
+    }
+
+    if (ws.getPipe("sink_metrics")) |_| {
+        var sink = try ws.runPipe("sink_metrics", params);
+        defer sink.deinit();
+        if (std.mem.indexOf(u8, sink.json, "sunk") == null) return error.SinkFailed;
+        std.log.info("sink_metrics OK ({d} bytes)", .{sink.json.len});
     }
 
     std.log.info("all workspace tests passed", .{});

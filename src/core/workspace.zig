@@ -98,6 +98,9 @@ pub const Workspace = struct {
             "plan_goal.pipe.json",
             "route_query.pipe.json",
             "find_contradictions.pipe.json",
+            "copy_tool_calls.pipe.json",
+            "sink_metrics.pipe.json",
+            "materialize_memory.pipe.json",
         };
         for (known) |fname| {
             var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -128,7 +131,31 @@ pub const Workspace = struct {
             first = false;
             const path = e.value_ptr.endpoint_path orelse "";
             try aw.writer.print(
-                \\{{"name":{f},"endpoint":{f}}}
+                \\{{"name":{f},"type":"{s}","endpoint":{f}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), @tagName(e.value_ptr.kind), std.json.fmt(path, .{}) },
+            );
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
+    pub fn listEndpointsJson(self: *Workspace, allocator: Allocator) ![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.writeAll("{\"endpoints\":[");
+        var first = true;
+        var it = self.pipes.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.kind != .endpoint and e.value_ptr.endpoint_path == null) continue;
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            const path = e.value_ptr.endpoint_path orelse blk: {
+                break :blk try std.fmt.allocPrint(allocator, "/v1/pipes/{s}", .{e.key_ptr.*});
+            };
+            defer if (e.value_ptr.endpoint_path == null) allocator.free(path);
+            try aw.writer.print(
+                \\{{"name":{f},"url":{f},"formats":["json","ndjson","csv"]}}
             ,
                 .{ std.json.fmt(e.key_ptr.*, .{}), std.json.fmt(path, .{}) },
             );
@@ -144,6 +171,41 @@ pub const Workspace = struct {
     ) !pipe_mod.PipeResult {
         const pipe = self.getPipe(name) orelse return error.PipeNotFound;
         return pipe_mod.execute(self.allocator, &self.store, pipe, params);
+    }
+
+    /// Tinybird MATERIALIZED analog: run all materialized pipes after ingest.
+    pub fn runMaterializedPipes(self: *Workspace) !void {
+        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer params.deinit(self.allocator);
+        var it = self.pipes.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.kind != .materialized) continue;
+            var result = self.runPipe(e.key_ptr.*, params) catch continue;
+            result.deinit();
+        }
+    }
+
+    pub fn logOp(
+        self: *Workspace,
+        kind: []const u8,
+        resource: []const u8,
+        detail: []const u8,
+    ) void {
+        const ts = formatUtcNow(self.allocator, self.io) catch return;
+        defer self.allocator.free(ts);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        aw.writer.print(
+            \\{{"ts":{f},"run_id":"ops","agent_id":"synapse","type":"ops","payload":{{"kind":{f},"resource":{f},"detail":{f}}}}}
+        ,
+            .{
+                std.json.fmt(ts, .{}),
+                std.json.fmt(kind, .{}),
+                std.json.fmt(resource, .{}),
+                std.json.fmt(detail, .{}),
+            },
+        ) catch return;
+        _ = self.store.ingestNdjson("synapse_ops_log", aw.written()) catch {};
     }
 
     pub fn remember(
@@ -314,12 +376,53 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
         .{ "find_contradictions.pipe.json",
             \\{
             \\  "name": "find_contradictions",
+            \\  "type": "endpoint",
             \\  "nodes": [
             \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
             \\    { "type": "materialize_graph", "layers": ["mind"] },
             \\    { "type": "project", "op": "contradict" }
             \\  ],
             \\  "endpoint": { "path": "/v1/dispute", "params": ["run_id"] }
+            \\}
+            \\
+        },
+        .{ "copy_tool_calls.pipe.json",
+            \\{
+            \\  "name": "copy_tool_calls",
+            \\  "type": "copy",
+            \\  "description": "Copy tool_call events into tool_calls datasource",
+            \\  "target_datasource": "tool_calls",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "type": "tool_call" } },
+            \\    { "type": "copy", "target_datasource": "tool_calls" }
+            \\  ]
+            \\}
+            \\
+        },
+        .{ "sink_metrics.pipe.json",
+            \\{
+            \\  "name": "sink_metrics",
+            \\  "type": "sink",
+            \\  "description": "Export tool failure metrics to a local file",
+            \\  "sink_path": ".synapse/exports/tool_failure_rate.json",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "tool_call" } },
+            \\    { "type": "aggregate", "op": "rate", "group_by": "name", "success_field": "ok" },
+            \\    { "type": "sink", "sink_path": ".synapse/exports/tool_failure_rate.json" }
+            \\  ]
+            \\}
+            \\
+        },
+        .{ "materialize_memory.pipe.json",
+            \\{
+            \\  "name": "materialize_memory",
+            \\  "type": "materialized",
+            \\  "description": "On ingest, copy memory_write events into memory_writes",
+            \\  "target_datasource": "memory_writes",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "type": "memory_write" } },
+            \\    { "type": "copy", "target_datasource": "memory_writes" }
+            \\  ]
             \\}
             \\
         },
