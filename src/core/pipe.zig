@@ -7,6 +7,8 @@ const context_pack = @import("context_pack.zig");
 const plan_mod = @import("plan.zig");
 const route_mod = @import("route.zig");
 const belief_mod = @import("belief.zig");
+const diff_mod = @import("diff.zig");
+const embed_mod = @import("embed.zig");
 
 pub const PipeNodeType = enum {
     filter,
@@ -30,7 +32,7 @@ pub const PipeKind = enum {
     }
 };
 
-pub const AggregateOp = enum { count, rate };
+pub const AggregateOp = enum { count, rate, sum };
 pub const ProjectOp = enum {
     context_pack,
     blast_radius,
@@ -38,6 +40,9 @@ pub const ProjectOp = enum {
     plan,
     route,
     contradict,
+    consolidate,
+    diff,
+    embed,
 };
 
 pub const PipeNode = struct {
@@ -271,6 +276,35 @@ pub fn execute(
                     .contradict => {
                         const g = &(graph orelse return error.GraphRequired);
                         const json = try belief_mod.findContradictions(allocator, g);
+                        if (last_json) |j| allocator.free(j);
+                        last_json = json;
+                    },
+                    .consolidate => {
+                        const g = &(graph orelse return error.GraphRequired);
+                        const json = try belief_mod.consolidate(allocator, g);
+                        if (last_json) |j| allocator.free(j);
+                        last_json = json;
+                    },
+                    .diff => {
+                        const ds = params.get("datasource") orelse "harness_events";
+                        if (params.get("run_a")) |ra| {
+                            const rb = params.get("run_b") orelse "";
+                            const json = try diff_mod.diffRuns(allocator, store, ds, ra, rb);
+                            if (last_json) |j| allocator.free(j);
+                            last_json = json;
+                        } else {
+                            const ck = params.get("checkpoint") orelse return error.MissingCheckpoint;
+                            const json = try diff_mod.diffAgainstCheckpoint(allocator, store.io, store, ds, ck);
+                            if (last_json) |j| allocator.free(j);
+                            last_json = json;
+                        }
+                    },
+                    .embed => {
+                        const g = &(graph orelse return error.GraphRequired);
+                        const query = params.get("query") orelse "";
+                        const lim_s = params.get("limit") orelse "8";
+                        const lim = std.fmt.parseInt(usize, lim_s, 10) catch 8;
+                        const json = try embed_mod.hybridRecall(allocator, g, query, lim);
                         if (last_json) |j| allocator.free(j);
                         last_json = json;
                     },

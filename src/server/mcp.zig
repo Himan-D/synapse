@@ -26,7 +26,7 @@ pub fn handle(allocator: Allocator, ws: *workspace_mod.Workspace, body: []const 
     }
     if (std.mem.eql(u8, method, "tools/list")) {
         return try rpcResult(allocator, id_v,
-            \\{"tools":[{"name":"synapse.ingest","description":"Ingest NDJSON events into a datasource","inputSchema":{"type":"object","properties":{"datasource":{"type":"string"},"events":{"type":"array"}},"required":["datasource","events"]}},{"name":"synapse.remember","description":"Store a Mind claim with confidence","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"agent_id":{"type":"string"},"text":{"type":"string"},"confidence":{"type":"number"}},"required":["run_id","text"]}},{"name":"synapse.recall","description":"Token-budgeted context pack for a run","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"query":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.plan","description":"Plan a goal into a tool/task DAG","inputSchema":{"type":"object","properties":{"goal":{"type":"string"},"run_id":{"type":"string"}},"required":["goal"]}},{"name":"synapse.route","description":"Route a query to the best tool/skill","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"run_id":{"type":"string"}},"required":["query"]}},{"name":"synapse.impact","description":"Blast radius from errors/tools","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"node_id":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.metrics","description":"Tool failure rate metrics","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}},{"name":"synapse.dispute","description":"Find contradictory Mind claims","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}}]}
+            \\{"tools":[{"name":"synapse.ingest","description":"Ingest NDJSON events into a datasource","inputSchema":{"type":"object","properties":{"datasource":{"type":"string"},"events":{"type":"array"}},"required":["datasource","events"]}},{"name":"synapse.remember","description":"Store a Mind claim with confidence","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"agent_id":{"type":"string"},"text":{"type":"string"},"confidence":{"type":"number"}},"required":["run_id","text"]}},{"name":"synapse.recall","description":"Token-budgeted context pack for a run","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"query":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.plan","description":"Plan a goal into a tool/task DAG","inputSchema":{"type":"object","properties":{"goal":{"type":"string"},"run_id":{"type":"string"}},"required":["goal"]}},{"name":"synapse.route","description":"Route a query to the best tool/skill","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"run_id":{"type":"string"}},"required":["query"]}},{"name":"synapse.impact","description":"Blast radius from errors/tools","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"node_id":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.metrics","description":"Tool failure rate metrics","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}},{"name":"synapse.dispute","description":"Find contradictory Mind claims","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}},{"name":"synapse.embed","description":"Hybrid embed recall over Mind claims","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"query":{"type":"string"}},"required":["run_id","query"]}},{"name":"synapse.graph","description":"Inspect World/Work/Mind graph","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}}]}
         );
     }
     if (std.mem.eql(u8, method, "tools/call")) {
@@ -103,6 +103,13 @@ fn callTool(allocator: Allocator, ws: *workspace_mod.Workspace, name: []const u8
     }
     if (std.mem.eql(u8, name, "synapse.dispute")) {
         return try runNamed(allocator, ws, "find_contradictions", args, &.{"run_id"});
+    }
+    if (std.mem.eql(u8, name, "synapse.embed")) {
+        return try runNamed(allocator, ws, "embed_recall", args, &.{ "run_id", "query", "limit" });
+    }
+    if (std.mem.eql(u8, name, "synapse.graph")) {
+        const run_id = if (args.object.get("run_id")) |r| r.string else "";
+        return try ws.graphJson(allocator, run_id);
     }
 
     return error.UnknownTool;

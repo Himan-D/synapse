@@ -1,0 +1,9 @@
+{
+  "tools": [
+    { "name": "grep", "requires": ["codebase"], "provides": ["search_hits"], "cost_tokens": 500, "cost_latency_ms": 80 },
+    { "name": "read_file", "requires": ["path"], "provides": ["file_contents"], "cost_tokens": 800, "cost_latency_ms": 40 },
+    { "name": "run_tests", "requires": ["codebase", "file_contents"], "provides": ["test_report"], "cost_tokens": 2000, "cost_latency_ms": 1500 },
+    { "name": "write_patch", "requires": ["file_contents", "search_hits"], "provides": ["patch"], "cost_tokens": 3000, "cost_latency_ms": 200 },
+    { "name": "deploy_check", "requires": ["patch", "test_report"], "provides": ["deploy_ready"], "cost_tokens": 1000, "cost_latency_ms": 900 }
+  ]
+}

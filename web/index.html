@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Synapse Playground</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a222c;
+      --ink: #e7ecf1;
+      --muted: #8b9aab;
+      --accent: #3d9cf0;
+      --line: #2a3542;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1c2a3a, var(--bg));
+      color: var(--ink);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+    }
+    header h1 {
+      margin: 0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 1.25rem;
+      letter-spacing: 0.04em;
+    }
+    header span { color: var(--muted); font-size: 0.9rem; }
+    main {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 0;
+      min-height: calc(100vh - 64px);
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      padding: 1rem;
+      background: color-mix(in srgb, var(--panel) 85%, transparent);
+    }
+    aside button, .row button {
+      width: 100%;
+      text-align: left;
+      margin: 0.25rem 0;
+      padding: 0.55rem 0.75rem;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    aside button:hover, .row button:hover { border-color: var(--accent); }
+    section { padding: 1.25rem 1.5rem; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .row input, .row select {
+      flex: 1;
+      min-width: 140px;
+      padding: 0.55rem 0.7rem;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+    }
+    .row button { width: auto; }
+    pre {
+      margin: 0;
+      padding: 1rem;
+      background: #0b1015;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: auto;
+      max-height: calc(100vh - 180px);
+      font-size: 0.85rem;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SYNAPSE</h1>
+    <span>Local playground · World / Work / Mind</span>
+  </header>
+  <main>
+    <aside>
+      <button data-path="/v1/workspace">Workspace</button>
+      <button data-path="/v1/endpoints">Endpoints</button>
+      <button data-path="/v1/recall?run_id=run_demo&query=risk">Recall</button>
+      <button data-path="/v1/plan?goal=fix%20risk%20bug&run_id=run_demo">Plan</button>
+      <button data-path="/v1/route?query=run%20tests&run_id=run_demo">Route</button>
+      <button data-path="/v1/impact?run_id=run_demo">Impact</button>
+      <button data-path="/v1/dispute?run_id=run_demo">Dispute</button>
+      <button data-path="/v1/embed?run_id=run_demo&query=margin">Embed recall</button>
+      <button data-path="/v1/consolidate?run_id=run_demo">Consolidate</button>
+      <button data-path="/v1/graph?run_id=run_demo">Graph</button>
+      <button data-path="/v1/metrics/tool_failure_rate?run_id=run_demo">Metrics</button>
+      <button data-path="/v1/pipes/tool_failure_rate.csv?run_id=run_demo">Metrics CSV</button>
+    </aside>
+    <section>
+      <div class="row">
+        <input id="custom" placeholder="/v1/recall?run_id=run_demo&query=risk" />
+        <button id="go">Run</button>
+      </div>
+      <pre id="out">Select a verb…</pre>
+    </section>
+  </main>
+  <script>
+    const out = document.getElementById("out");
+    async function run(path) {
+      out.textContent = "Loading " + path + "…";
+      try {
+        const res = await fetch(path);
+        const text = await res.text();
+        try {
+          out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+        } catch {
+          out.textContent = text;
+        }
+      } catch (e) {
+        out.textContent = String(e);
+      }
+    }
+    document.querySelectorAll("aside button").forEach((b) => {
+      b.addEventListener("click", () => run(b.dataset.path));
+    });
+    document.getElementById("go").addEventListener("click", () => {
+      const v = document.getElementById("custom").value.trim();
+      if (v) run(v);
+    });
+  </script>
+</body>
+</html>

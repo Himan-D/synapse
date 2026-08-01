@@ -52,6 +52,51 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         try runToken(allocator, io, args);
         return;
     }
+    if (std.mem.eql(u8, cmd, "branch")) {
+        if (args.len < 4) return error.Usage;
+        const sub = args[2];
+        const name = args[3];
+        const root = flagOr(args, "--root", ".");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        if (std.mem.eql(u8, sub, "create")) {
+            const json = try ws.createBranch(name);
+            defer allocator.free(json);
+            std.debug.print("{s}\n", .{json});
+            return;
+        }
+        return error.Usage;
+    }
+    if (std.mem.eql(u8, cmd, "graph")) {
+        const root = flagOr(args, "--root", ".");
+        const run_id = flagOr(args, "--run-id", "run_demo");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.graphJson(allocator, run_id);
+        defer allocator.free(json);
+        std.debug.print("{s}\n", .{json});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "checkpoint")) {
+        const root = flagOr(args, "--root", ".");
+        const name = flagOr(args, "--name", "latest");
+        const ds = flagOr(args, "--datasource", "harness_events");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.checkpoint(name, ds);
+        defer allocator.free(json);
+        std.debug.print("{s}\n", .{json});
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "deploy")) {
+        // Local-first stub: validate + report (cloud promotion is roadmap).
+        const root = flagOr(args, "--root", ".");
+        var report = try validate_mod.buildWorkspace(allocator, io, root);
+        defer report.deinit();
+        std.debug.print("{{\"deploy\":\"local-validate\",\"report\":{s}}}\n", .{report.json});
+        if (!report.ok) return error.BuildFailed;
+        return;
+    }
     if (std.mem.eql(u8, cmd, "dev")) {
         const root = flagOr(args, "--root", ".");
         const port_s = flagOr(args, "--port", "8787");
@@ -237,6 +282,10 @@ fn printHelp() !void {
         \\  synapse workspace --root <dir>
         \\  synapse endpoint --root <dir>
         \\  synapse token show|create [name] --root <dir> [--scope SCOPE]
+        \\  synapse branch create <name> --root <dir>
+        \\  synapse checkpoint --name <id> --root <dir>
+        \\  synapse graph --root <dir> --run-id <id>
+        \\  synapse deploy --root <dir>
         \\  synapse dev --root <dir> --port <port>
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
@@ -244,9 +293,10 @@ fn printHelp() !void {
         \\  synapse test --root <dir>
         \\
         \\Env:
-        \\  SYNAPSE_REQUIRE_AUTH=1   enforce Bearer token from .synapse/token
+        \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens
         \\
-        \\See docs/tinybird-parity.md for Tinybird feature mapping.
+        \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
+        \\See docs/tinybird-parity.md and PRODUCT.md.
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -329,6 +379,25 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
         if (std.mem.indexOf(u8, sink.json, "sunk") == null) return error.SinkFailed;
         std.log.info("sink_metrics OK ({d} bytes)", .{sink.json.len});
     }
+
+    if (ws.getPipe("embed_recall")) |_| {
+        var emb = try ws.runPipe("embed_recall", params);
+        defer emb.deinit();
+        if (std.mem.indexOf(u8, emb.json, "hits") == null) return error.EmbedFailed;
+        std.log.info("embed_recall OK ({d} bytes)", .{emb.json.len});
+    }
+
+    if (ws.getPipe("consolidate_claims")) |_| {
+        var cons = try ws.runPipe("consolidate_claims", params);
+        defer cons.deinit();
+        if (std.mem.indexOf(u8, cons.json, "clusters") == null) return error.ConsolidateFailed;
+        std.log.info("consolidate_claims OK ({d} bytes)", .{cons.json.len});
+    }
+
+    const gjson = try ws.graphJson(allocator, "run_demo");
+    defer allocator.free(gjson);
+    if (std.mem.indexOf(u8, gjson, "nodes") == null) return error.GraphFailed;
+    std.log.info("graph OK ({d} bytes)", .{gjson.len});
 
     std.log.info("all workspace tests passed", .{});
 }

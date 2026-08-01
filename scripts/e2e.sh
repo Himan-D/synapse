@@ -74,4 +74,20 @@ echo "==> endpoints list"
 curl -sf "http://127.0.0.1:8787/v1/endpoints" | head -c 300
 echo
 
+echo "==> graph HTTP"
+curl -sf "http://127.0.0.1:8787/v1/graph?run_id=run_demo" | head -c 300
+echo
+
+echo "==> embed HTTP"
+curl -sf "http://127.0.0.1:8787/v1/embed?run_id=run_demo&query=margin" | head -c 300
+echo
+
+echo "==> consolidate HTTP"
+curl -sf "http://127.0.0.1:8787/v1/consolidate?run_id=run_demo" | head -c 300
+echo
+
+echo "==> playground"
+curl -sf "http://127.0.0.1:8787/" | head -c 120
+echo
+
 echo "==> e2e OK"

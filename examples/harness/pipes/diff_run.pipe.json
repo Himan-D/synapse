@@ -1,0 +1,10 @@
+{
+  "name": "diff_run",
+  "type": "endpoint",
+  "description": "Diff two runs or a checkpoint",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "project", "op": "diff" }
+  ],
+  "endpoint": { "path": "/v1/diff", "params": ["run_a", "run_b", "checkpoint", "datasource"] }
+}

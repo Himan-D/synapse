@@ -4,6 +4,9 @@ const Io = std.Io;
 const store_mod = @import("store.zig");
 const pipe_mod = @import("pipe.zig");
 const belief_mod = @import("belief.zig");
+const auth_mod = @import("auth.zig");
+const graph_mod = @import("graph.zig");
+const diff_mod = @import("diff.zig");
 
 pub const Workspace = struct {
     allocator: Allocator,
@@ -11,6 +14,7 @@ pub const Workspace = struct {
     root: []const u8,
     name: []const u8,
     token: ?[]const u8,
+    auth: auth_mod.Auth,
     store: store_mod.Store,
     pipes: std.StringArrayHashMapUnmanaged(pipe_mod.Pipe) = .empty,
 
@@ -24,12 +28,9 @@ pub const Workspace = struct {
         defer parsed.deinit();
         const name = try allocator.dupe(u8, parsed.value.object.get("name").?.string);
 
-        var token: ?[]const u8 = null;
-        const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
-        if (Io.Dir.cwd().readFileAlloc(io, token_path, allocator, .unlimited)) |tok_bytes| {
-            defer allocator.free(tok_bytes);
-            token = try allocator.dupe(u8, std.mem.trim(u8, tok_bytes, " \t\r\n"));
-        } else |_| {}
+        var auth = try auth_mod.Auth.load(allocator, io, root);
+        errdefer auth.deinit();
+        const token = if (auth.admin) |a| try allocator.dupe(u8, a) else null;
 
         var store = try store_mod.Store.init(allocator, io, root);
         errdefer store.deinit();
@@ -40,6 +41,7 @@ pub const Workspace = struct {
             .root = try allocator.dupe(u8, root),
             .name = name,
             .token = token,
+            .auth = auth,
             .store = store,
         };
         errdefer ws.deinit();
@@ -56,10 +58,21 @@ pub const Workspace = struct {
         }
         self.pipes.deinit(self.allocator);
         self.store.deinit();
+        self.auth.deinit();
         self.allocator.free(self.root);
         self.allocator.free(self.name);
         if (self.token) |t| self.allocator.free(t);
         self.* = undefined;
+    }
+
+    pub fn reloadPipes(self: *Workspace) !void {
+        var it = self.pipes.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.deinit();
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.pipes.clearRetainingCapacity();
+        try self.loadPipes();
     }
 
     fn loadPipes(self: *Workspace) !void {
@@ -101,6 +114,9 @@ pub const Workspace = struct {
             "copy_tool_calls.pipe.json",
             "sink_metrics.pipe.json",
             "materialize_memory.pipe.json",
+            "diff_run.pipe.json",
+            "embed_recall.pipe.json",
+            "consolidate_claims.pipe.json",
         };
         for (known) |fname| {
             var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -232,15 +248,117 @@ pub const Workspace = struct {
     }
 
     pub fn checkBearer(self: *Workspace, head_buffer: []const u8) bool {
-        const token = self.token orelse return true; // no token configured → open
-        // Require Authorization header when token is set
-        if (std.mem.indexOf(u8, head_buffer, "Authorization:") == null and
-            std.mem.indexOf(u8, head_buffer, "authorization:") == null)
-        {
-            // Allow health without auth
-            return false;
+        return self.authorize(head_buffer, .GET, "/v1/workspace");
+    }
+
+    pub fn authorize(self: *Workspace, head_buffer: []const u8, method: std.http.Method, path: []const u8) bool {
+        if (self.auth.admin == null and self.auth.entries.items.len == 0) return true;
+        return self.auth.authorize(head_buffer, method, path);
+    }
+
+    pub fn writeDispute(
+        self: *Workspace,
+        run_id: []const u8,
+        claim_a: []const u8,
+        claim_b: []const u8,
+        reason: []const u8,
+    ) ![]u8 {
+        const ts = try formatUtcNow(self.allocator, self.io);
+        defer self.allocator.free(ts);
+        const line = try belief_mod.disputeEventJson(self.allocator, run_id, claim_a, claim_b, reason, ts);
+        defer self.allocator.free(line);
+        _ = try self.store.ingestNdjson("harness_events", line);
+        _ = try self.store.ingestNdjson("beliefs", line);
+        return try std.fmt.allocPrint(
+            self.allocator,
+            \\{{"disputed":true,"a":{f},"b":{f},"reason":{f}}}
+        ,
+            .{ std.json.fmt(claim_a, .{}), std.json.fmt(claim_b, .{}), std.json.fmt(reason, .{}) },
+        );
+    }
+
+    pub fn graphJson(self: *Workspace, allocator: Allocator, run_id: []const u8) ![]u8 {
+        var where: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer where.deinit(allocator);
+        if (run_id.len > 0) try where.put(allocator, "run_id", run_id);
+        const evs = try self.store.filterEvents(allocator, "harness_events", where);
+        defer allocator.free(evs);
+        const layers = [_]graph_mod.Layer{ .world, .work, .mind };
+        var g = try graph_mod.materialize(allocator, evs, &layers);
+        defer g.deinit();
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.writeAll("{\"nodes\":[");
+        var first = true;
+        var nit = g.nodes.iterator();
+        while (nit.next()) |e| {
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print(
+                \\{{"id":{f},"layer":{f},"kind":{f},"props":{s}}}
+            ,
+                .{
+                    std.json.fmt(e.value_ptr.id, .{}),
+                    std.json.fmt(e.value_ptr.layer.toString(), .{}),
+                    std.json.fmt(e.value_ptr.kind, .{}),
+                    e.value_ptr.props_json,
+                },
+            );
         }
-        return std.mem.indexOf(u8, head_buffer, token) != null;
+        try aw.writer.writeAll("],\"edges\":[");
+        first = true;
+        for (g.edges.items) |edge| {
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print(
+                \\{{"id":{f},"src":{f},"dst":{f},"kind":{f},"confidence":{d:.2}}}
+            ,
+                .{
+                    std.json.fmt(edge.id, .{}),
+                    std.json.fmt(edge.src, .{}),
+                    std.json.fmt(edge.dst, .{}),
+                    std.json.fmt(edge.kind, .{}),
+                    edge.confidence,
+                },
+            );
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
+    pub fn checkpoint(self: *Workspace, name: []const u8, datasource: []const u8) ![]u8 {
+        return diff_mod.saveCheckpoint(self.allocator, self.io, &self.store, self.root, datasource, name);
+    }
+
+    pub fn createBranch(self: *Workspace, name: []const u8) ![]u8 {
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const src = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/data", .{self.root});
+        const dst_dir = try std.fmt.allocPrint(self.allocator, "{s}/.synapse/branches/{s}/data", .{ self.root, name });
+        defer self.allocator.free(dst_dir);
+        try Io.Dir.cwd().createDirPath(self.io, dst_dir);
+
+        // Copy each ndjson file
+        if (Io.Dir.cwd().openDir(self.io, src, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close(self.io);
+            var it = dir.iterate();
+            while (it.next(self.io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                const from = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ src, entry.name });
+                defer self.allocator.free(from);
+                const to = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dst_dir, entry.name });
+                defer self.allocator.free(to);
+                const bytes = try Io.Dir.cwd().readFileAlloc(self.io, from, self.allocator, .unlimited);
+                defer self.allocator.free(bytes);
+                try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = to, .data = bytes });
+            }
+        } else |_| {}
+
+        return try std.fmt.allocPrint(self.allocator, "{{\"branch\":{f},\"path\":{f}}}", .{
+            std.json.fmt(name, .{}),
+            std.json.fmt(dst_dir, .{}),
+        });
     }
 };
 

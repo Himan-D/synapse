@@ -47,7 +47,7 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         return;
     }
 
-    // Optional Bearer auth: set SYNAPSE_REQUIRE_AUTH=1 to enforce workspace token.
+    // Optional Bearer auth: set SYNAPSE_REQUIRE_AUTH=1 to enforce scoped tokens.
     const require_auth = blk: {
         if (std.c.getenv("SYNAPSE_REQUIRE_AUTH")) |v| {
             const s = std.mem.span(v);
@@ -55,11 +55,22 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         }
         break :blk false;
     };
-    if (require_auth and ws.token != null and !ws.checkBearer(request.head_buffer)) {
+    if (require_auth and !ws.authorize(request.head_buffer, method, path)) {
         try request.respond("{\"error\":\"unauthorized\"}\n", .{
             .status = .unauthorized,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
+    if (method == .GET and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/ui") or std.mem.eql(u8, path, "/ui/"))) {
+        const html = try loadUiHtml(allocator, io, ws.root);
+        defer allocator.free(html);
+        try request.respond(html, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
             },
         });
         return;
@@ -199,6 +210,83 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/dispute")) {
         return runAlias(allocator, &request, ws, "find_contradictions", target, null);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) {
+        const body = try readBody(allocator, &request);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const json = try ws.writeDispute(
+            obj.get("run_id").?.string,
+            obj.get("a").?.string,
+            obj.get("b").?.string,
+            if (obj.get("reason")) |r| r.string else "manual",
+        );
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/graph")) {
+        const qmark = std.mem.indexOfScalar(u8, target, '?');
+        const query = if (qmark) |i| target[i + 1 ..] else "";
+        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer {
+            var it = params.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            params.deinit(allocator);
+        }
+        try parseQuery(allocator, query, &params);
+        const json = try ws.graphJson(allocator, params.get("run_id") orelse "");
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/embed")) {
+        return runAlias(allocator, &request, ws, "embed_recall", target, null);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/diff")) {
+        return runAlias(allocator, &request, ws, "diff_run", target, null);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/consolidate")) {
+        return runAlias(allocator, &request, ws, "consolidate_claims", target, null);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/v1/checkpoint")) {
+        const body = try readBody(allocator, &request);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const name = obj.get("name").?.string;
+        const ds = if (obj.get("datasource")) |d| d.string else "harness_events";
+        const json = try ws.checkpoint(name, ds);
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/v1/reload")) {
+        try ws.reloadPipes();
+        try request.respond("{\"reloaded\":true}\n", .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) {
@@ -366,4 +454,18 @@ fn readBody(allocator: Allocator, request: *std.http.Server.Request) ![]u8 {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.StreamTooLong,
     };
+}
+
+fn loadUiHtml(allocator: Allocator, io: Io, workspace_root: []const u8) ![]u8 {
+    _ = workspace_root;
+    // Prefer repo web/ relative to cwd, then embedded fallback.
+    const candidates = [_][]const u8{ "web/index.html", "ui/index.html" };
+    for (candidates) |p| {
+        if (Io.Dir.cwd().readFileAlloc(io, p, allocator, .unlimited)) |bytes| return bytes else |_| {}
+    }
+    return try allocator.dupe(u8,
+        \\<!doctype html><html><body style="font-family:system-ui;padding:2rem">
+        \\<h1>Synapse</h1><p>Place <code>web/index.html</code> next to the binary cwd for the playground.</p>
+        \\<p><a href="/v1/workspace">/v1/workspace</a></p></body></html>
+    );
 }

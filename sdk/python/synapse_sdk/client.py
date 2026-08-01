@@ -126,6 +126,33 @@ class Synapse:
         path = f"/v1/pipes/{name}.{format}" if format != "json" else f"/v1/pipes/{name}"
         return self._request("GET", path, query=params)
 
+    def graph(self, run_id: str = "", **extra: Any) -> dict:
+        return self._request("GET", "/v1/graph", query={"run_id": run_id, **extra})
+
+    def embed(self, run_id: str, query: str, limit: int = 8, **extra: Any) -> dict:
+        return self._request(
+            "GET", "/v1/embed", query={"run_id": run_id, "query": query, "limit": limit, **extra}
+        )
+
+    def consolidate(self, run_id: str = "", **extra: Any) -> dict:
+        return self._request("GET", "/v1/consolidate", query={"run_id": run_id, **extra})
+
+    def checkpoint(self, name: str, datasource: str = "harness_events") -> dict:
+        return self._request(
+            "POST",
+            "/v1/checkpoint",
+            body=json.dumps({"name": name, "datasource": datasource}).encode("utf-8"),
+            content_type="application/json",
+        )
+
+    def write_dispute(self, run_id: str, a: str, b: str, reason: str = "manual") -> dict:
+        return self._request(
+            "POST",
+            "/v1/dispute",
+            body=json.dumps({"run_id": run_id, "a": a, "b": b, "reason": reason}).encode("utf-8"),
+            content_type="application/json",
+        )
+
     def tool_call_event(
         self,
         run_id: str,

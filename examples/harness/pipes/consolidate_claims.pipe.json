@@ -1,0 +1,11 @@
+{
+  "name": "consolidate_claims",
+  "type": "endpoint",
+  "description": "Cluster near-duplicate Mind claims",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["mind"] },
+    { "type": "project", "op": "consolidate" }
+  ],
+  "endpoint": { "path": "/v1/consolidate", "params": ["run_id"] }
+}

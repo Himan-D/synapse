@@ -283,8 +283,14 @@ One write path → memory **and** metrics. No dual instrumentation.
 | Python SDK (`sdk/python`) | **Shipped** |
 | Confidence-weighted recall | **Shipped** |
 | Tinybird parity matrix | [docs/tinybird-parity.md](docs/tinybird-parity.md) |
-| embed hybrid retrieval | Interface + stub |
-| Cloud multi-tenant · SQL pipes · UI · JWT | Roadmap |
+| Mind decay × confidence recall | **Shipped** |
+| consolidate · write dispute · diff · checkpoint | **Shipped** |
+| Local embed hybrid recall | **Shipped** (hash embedder) |
+| Scoped token auth | **Shipped** |
+| Graph inspect API · playground UI | **Shipped** |
+| Local branches · `synapse deploy` validate | **Shipped** (local stubs) |
+| TypeScript SDK + Python pipe DSL / instrument | **Shipped** |
+| Cloud multi-tenant · SQL pipes · JWT · Kafka | Roadmap |
 | Hypergraphs · CRDT merge · GNN | Research |
 
 ---

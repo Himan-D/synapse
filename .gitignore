@@ -4,9 +4,15 @@ zig-out/
 .synapse/data/
 .synapse/exports/
 .synapse/tokens.json
+.synapse/checkpoints/
+.synapse/branches/
 examples/**/.synapse/data/
 examples/**/.synapse/exports/
 examples/**/.synapse/tokens.json
+examples/**/.synapse/checkpoints/
+examples/**/.synapse/branches/
+sdk/typescript/node_modules/
+sdk/typescript/dist/
 *.o
 *.obj
 .DS_Store

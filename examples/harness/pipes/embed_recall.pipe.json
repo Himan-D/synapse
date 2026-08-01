@@ -1,0 +1,11 @@
+{
+  "name": "embed_recall",
+  "type": "endpoint",
+  "description": "Hybrid embedding recall over Mind claims",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["mind"] },
+    { "type": "project", "op": "embed" }
+  ],
+  "endpoint": { "path": "/v1/embed", "params": ["run_id", "query", "limit"] }
+}

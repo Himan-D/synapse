@@ -19,8 +19,9 @@ zig build
 ./zig-out/bin/synapse ingest harness_events examples/harness/sample_events.ndjson --root examples/harness --replace
 ./zig-out/bin/synapse test --root examples/harness
 
-# serve HTTP + MCP
+# serve HTTP + MCP + playground UI
 ./zig-out/bin/synapse dev --root examples/harness --port 8787
+# open http://127.0.0.1:8787/
 ```
 
 In another terminal:

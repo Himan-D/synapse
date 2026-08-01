@@ -55,7 +55,11 @@ pub fn buildPack(
             belief_mod.confidenceOf(allocator, node.props_json)
         else
             1.0;
-        const score = (node.score + kindBoost(node.kind) + queryBoost(query, node)) * conf;
+        const decay = if (std.mem.eql(u8, node.kind, "claim"))
+            belief_mod.decayFactor(allocator, node.props_json, 0)
+        else
+            1.0;
+        const score = (node.score + kindBoost(node.kind) + queryBoost(query, node)) * conf * decay;
         try ranked.append(allocator, .{ .idx = i, .score = score });
     }
 

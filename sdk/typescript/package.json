@@ -1,0 +1,20 @@
+{
+  "name": "@himand/synapse-sdk",
+  "version": "0.2.0",
+  "description": "TypeScript client for Synapse — Tinybird for AI harnesses",
+  "type": "module",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "exports": {
+    ".": "./src/client.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "files": ["src", "dist", "README.md"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}
