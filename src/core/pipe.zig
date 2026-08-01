@@ -4,6 +4,9 @@ const event_mod = @import("event.zig");
 const store_mod = @import("store.zig");
 const graph_mod = @import("graph.zig");
 const context_pack = @import("context_pack.zig");
+const plan_mod = @import("plan.zig");
+const route_mod = @import("route.zig");
+const belief_mod = @import("belief.zig");
 
 pub const PipeNodeType = enum {
     filter,
@@ -13,7 +16,14 @@ pub const PipeNodeType = enum {
 };
 
 pub const AggregateOp = enum { count, rate };
-pub const ProjectOp = enum { context_pack, blast_radius, passthrough };
+pub const ProjectOp = enum {
+    context_pack,
+    blast_radius,
+    passthrough,
+    plan,
+    route,
+    contradict,
+};
 
 pub const PipeNode = struct {
     type: PipeNodeType,
@@ -205,6 +215,26 @@ pub fn execute(
                     .blast_radius => {
                         const g = &(graph orelse return error.GraphRequired);
                         const json = try runBlastRadius(allocator, g, params.get("node_id"));
+                        if (last_json) |j| allocator.free(j);
+                        last_json = json;
+                    },
+                    .plan => {
+                        const goal = params.get("goal") orelse params.get("query") orelse "investigate";
+                        const gptr: ?*const graph_mod.Graph = if (graph) |*g| g else null;
+                        const json = try plan_mod.planGoal(allocator, goal, gptr);
+                        if (last_json) |j| allocator.free(j);
+                        last_json = json;
+                    },
+                    .route => {
+                        const query = params.get("query") orelse params.get("goal") orelse "";
+                        const gptr: ?*const graph_mod.Graph = if (graph) |*g| g else null;
+                        const json = try route_mod.routeQuery(allocator, query, gptr);
+                        if (last_json) |j| allocator.free(j);
+                        last_json = json;
+                    },
+                    .contradict => {
+                        const g = &(graph orelse return error.GraphRequired);
+                        const json = try belief_mod.findContradictions(allocator, g);
                         if (last_json) |j| allocator.free(j);
                         last_json = json;
                     },

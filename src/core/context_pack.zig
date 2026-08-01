@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
+const belief_mod = @import("belief.zig");
 
 pub const ContextPack = struct {
     allocator: Allocator,
@@ -50,7 +51,11 @@ pub fn buildPack(
 
     const values = graph.nodes.values();
     for (values, 0..) |node, i| {
-        const score = node.score + kindBoost(node.kind) + queryBoost(query, node);
+        const conf = if (std.mem.eql(u8, node.kind, "claim"))
+            belief_mod.confidenceOf(allocator, node.props_json)
+        else
+            1.0;
+        const score = (node.score + kindBoost(node.kind) + queryBoost(query, node)) * conf;
         try ranked.append(allocator, .{ .idx = i, .score = score });
     }
 

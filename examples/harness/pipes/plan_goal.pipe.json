@@ -1,0 +1,9 @@
+{
+  "name": "plan_goal",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["world", "work"] },
+    { "type": "project", "op": "plan" }
+  ],
+  "endpoint": { "path": "/v1/plan", "params": ["goal", "run_id"] }
+}

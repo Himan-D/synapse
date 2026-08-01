@@ -34,9 +34,10 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
 
     const method = request.head.method;
     const target = request.head.target;
+    const path = pathOnlyStr(target);
 
-    if (method == .GET and pathOnly(target, "/health")) {
-        try request.respond("{\"ok\":true}\n", .{
+    if (method == .GET and std.mem.eql(u8, path, "/health")) {
+        try request.respond("{\"ok\":true,\"product\":\"synapse\"}\n", .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
             },
@@ -44,8 +45,35 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         return;
     }
 
-    if (method == .POST and std.mem.startsWith(u8, pathOnlyStr(target), "/v1/events/")) {
-        const path = pathOnlyStr(target);
+    // Optional Bearer auth: set SYNAPSE_REQUIRE_AUTH=1 to enforce workspace token.
+    const require_auth = blk: {
+        if (std.posix.getenv("SYNAPSE_REQUIRE_AUTH")) |v| {
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        }
+        break :blk false;
+    };
+    if (require_auth and ws.token != null and !ws.checkBearer(request.head_buffer)) {
+        try request.respond("{\"error\":\"unauthorized\"}\n", .{
+            .status = .unauthorized,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
+    if (method == .GET and std.mem.eql(u8, path, "/v1/workspace")) {
+        const json = try ws.listPipesJson(allocator);
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/events/")) {
         const ds = path["/v1/events/".len..];
         const body = try readBody(allocator, &request);
         defer allocator.free(body);
@@ -60,23 +88,55 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
         return;
     }
 
-    if (method == .GET and std.mem.startsWith(u8, pathOnlyStr(target), "/v1/pipes/")) {
-        const path = pathOnlyStr(target);
+    if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) {
+        const body = try readBody(allocator, &request);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const run_id = obj.get("run_id").?.string;
+        const agent_id = if (obj.get("agent_id")) |a| a.string else "agent";
+        const text = obj.get("text").?.string;
+        const confidence: f32 = if (obj.get("confidence")) |c| switch (c) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => 0.8,
+        } else 0.8;
+        const json = try ws.remember(run_id, agent_id, text, confidence);
+        defer allocator.free(json);
+        try request.respond(json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/pipes/")) {
         const name = path["/v1/pipes/".len..];
         return runAlias(allocator, &request, ws, name, target);
     }
 
-    if (method == .GET and std.mem.startsWith(u8, pathOnlyStr(target), "/v1/recall")) {
+    if (method == .GET and std.mem.eql(u8, path, "/v1/recall")) {
         return runAlias(allocator, &request, ws, "recall_context", target);
     }
-    if (method == .GET and std.mem.startsWith(u8, pathOnlyStr(target), "/v1/metrics/tool_failure_rate")) {
+    if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/tool_failure_rate")) {
         return runAlias(allocator, &request, ws, "tool_failure_rate", target);
     }
-    if (method == .GET and std.mem.startsWith(u8, pathOnlyStr(target), "/v1/impact")) {
+    if (method == .GET and std.mem.eql(u8, path, "/v1/impact")) {
         return runAlias(allocator, &request, ws, "blast_radius", target);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/plan")) {
+        return runAlias(allocator, &request, ws, "plan_goal", target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/route")) {
+        return runAlias(allocator, &request, ws, "route_query", target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/dispute")) {
+        return runAlias(allocator, &request, ws, "find_contradictions", target);
+    }
 
-    if (method == .POST and pathOnly(target, "/v1/mcp")) {
+    if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) {
         const body = try readBody(allocator, &request);
         defer allocator.free(body);
         const resp = try mcp_mod.handle(allocator, ws, body);
@@ -95,10 +155,6 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
             .{ .name = "content-type", .value = "application/json" },
         },
     });
-}
-
-fn pathOnly(target: []const u8, want: []const u8) bool {
-    return std.mem.eql(u8, pathOnlyStr(target), want);
 }
 
 fn pathOnlyStr(target: []const u8) []const u8 {
@@ -148,7 +204,27 @@ fn parseQuery(allocator: Allocator, query: []const u8, params: *std.StringHashMa
         if (pair.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = try allocator.dupe(u8, pair[0..eq]);
-        const val = try allocator.dupe(u8, pair[eq + 1 ..]);
+        const val_raw = pair[eq + 1 ..];
+        // minimal URL decode for %20 and +
+        var val_buf: std.ArrayList(u8) = .empty;
+        defer val_buf.deinit(allocator);
+        var i: usize = 0;
+        while (i < val_raw.len) : (i += 1) {
+            if (val_raw[i] == '+') {
+                try val_buf.append(allocator, ' ');
+            } else if (val_raw[i] == '%' and i + 2 < val_raw.len) {
+                const hex = val_raw[i + 1 .. i + 3];
+                const byte = std.fmt.parseInt(u8, hex, 16) catch {
+                    try val_buf.append(allocator, val_raw[i]);
+                    continue;
+                };
+                try val_buf.append(allocator, byte);
+                i += 2;
+            } else {
+                try val_buf.append(allocator, val_raw[i]);
+            }
+        }
+        const val = try allocator.dupe(u8, val_buf.items);
         try params.put(allocator, key, val);
     }
 }
@@ -158,10 +234,9 @@ fn readBody(allocator: Allocator, request: *std.http.Server.Request) ![]u8 {
     const body_reader = request.readerExpectContinue(&transfer_buf) catch {
         return try allocator.dupe(u8, "");
     };
-    const bytes = body_reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+    return body_reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
         error.ReadFailed => return error.ReadFailed,
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.StreamTooLong,
     };
-    return bytes;
 }

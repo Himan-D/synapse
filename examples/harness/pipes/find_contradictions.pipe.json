@@ -1,0 +1,9 @@
+{
+  "name": "find_contradictions",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["mind"] },
+    { "type": "project", "op": "contradict" }
+  ],
+  "endpoint": { "path": "/v1/dispute", "params": ["run_id"] }
+}

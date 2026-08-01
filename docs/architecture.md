@@ -1,129 +1,81 @@
-# Synapse Architecture
+# Synapse Architecture (Full Product)
+
+See also [PRODUCT.md](../PRODUCT.md) for the product thesis and verb catalog.
 
 ## Runtime flow
 
 ```
-AgentHarness ──NDJSON──► EventsAPI ──► Datasources (append log)
-                                      │
-                                      ▼
-                                   Pipes
-                          ┌──────────┼──────────┐
-                          ▼          ▼          ▼
-                       World       Work        Mind
-                          │          │          │
-                          └────┬─────┴────┬─────┘
-                               ▼          ▼
-                          MetricsViews  ContextPack
-                               │          │
-                               └────┬─────┘
-                                    ▼
-                           HTTP endpoints + MCP
+Harness / SDK / MCP
+        │
+        ▼
+   HTTP · CLI · MCP
+        │
+        ▼
+ Datasources (append-only NDJSON)
+        │
+        ▼
+     Pipe engine
+   filter → materialize_graph → project/aggregate
+        │
+   ┌────┼────┐
+   ▼    ▼    ▼
+ World Work Mind  (+ Metrics views)
+   │    │    │
+   └────┼────┘
+        ▼
+ Endpoints: recall · plan · route · impact · metrics · dispute · remember
 ```
 
-## Event envelope
+## Modules (Zig)
 
-Every datasource row shares:
-
-```json
-{
-  "ts": "ISO-8601",
-  "run_id": "string",
-  "agent_id": "string",
-  "type": "tool_call|llm_span|memory_write|plan_step|error",
-  "payload": { }
-}
-```
-
-Built-in datasources: `harness_events`, `tool_calls`, `llm_spans`, `memory_writes`.
-
-## Graph primitives
-
-```
-Node { id, layer: world|work|mind, kind, props_json, valid_from, valid_to }
-Edge { id, src, dst, kind, confidence, evidence_json, props_json }
-```
-
-Materialization rules (MVP):
-
-| Event type | Nodes / edges |
+| Module | Responsibility |
 |---|---|
-| `tool_call` | Work node `tool_op:{name}`, World node `tool:{name}`, edge `calls` |
-| `memory_write` | Mind node `claim:{hash}`, edge `derived_from` run |
-| `plan_step` | Work node `task:{id}`, edge `enables` / `blocks` |
-| `error` | Work node `error:{id}`, edge `caused_by` tool_op |
-| `llm_span` | Work node `llm:{id}` (optional World `model:{name}`) |
+| `core/event.zig` | Envelope parse/validate |
+| `core/store.zig` | Append log + indexes + persist |
+| `core/graph.zig` | World/Work/Mind materialization |
+| `core/pipe.zig` | Pipe IR + executor |
+| `core/context_pack.zig` | Token-budgeted recall (confidence-weighted) |
+| `core/plan.zig` | Goal → tool/task DAG |
+| `core/route.zig` | Query → best tool/skill |
+| `core/belief.zig` | remember events + contradiction detection |
+| `core/workspace.zig` | Load workspace, scan pipes, verbs |
+| `server/http.zig` | HTTP API |
+| `server/mcp.zig` | MCP JSON-RPC tools |
+| `cli/commands.zig` | CLI |
 
-## Pipe IR
+## Pipe project ops
 
-Pipe files are JSON (`*.pipe.json`):
-
-```json
-{
-  "name": "recall_context",
-  "nodes": [
-    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
-    { "type": "materialize_graph", "layers": ["mind", "world"] },
-    { "type": "project", "op": "context_pack", "budget_tokens": 4000 }
-  ],
-  "endpoint": { "path": "/v1/recall", "params": ["run_id", "query"] }
-}
-```
-
-Node types:
-
-1. **filter** — select events by equality on envelope fields (`{{param}}` substitution)
-2. **aggregate** — `count` / `rate` grouped by a field (Tinybird-style metrics)
-3. **materialize_graph** — apply materialization rules into World/Work/Mind
-4. **project** — `context_pack` | `blast_radius` | `passthrough`
-
-## Persistence
-
-- Append-only NDJSON under `.synapse/data/{datasource}.ndjson`
-- In-memory indexes rebuilt on workspace load (run_id → event offsets)
-- Graph is ephemeral materialization from filtered events (not separately persisted in MVP)
+`context_pack` · `blast_radius` · `plan` · `route` · `contradict` · `passthrough`
 
 ## HTTP API
 
-| Method | Path | Body / query | Response |
-|---|---|---|---|
-| POST | `/v1/events/{datasource}` | NDJSON body | `{ "ingested": N }` |
-| GET | `/v1/pipes/{name}?k=v` | query params | JSON result |
-| POST | `/v1/mcp` | JSON-RPC | MCP result |
-| GET | `/health` | — | `{ "ok": true }` |
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness |
+| GET | `/v1/workspace` | List pipes |
+| POST | `/v1/events/{ds}` | Ingest NDJSON |
+| POST | `/v1/remember` | Mind claim upsert |
+| GET | `/v1/recall` | Context pack |
+| GET | `/v1/plan` | Plan DAG |
+| GET | `/v1/route` | Tool routing |
+| GET | `/v1/impact` | Blast radius |
+| GET | `/v1/metrics/tool_failure_rate` | Aggregates |
+| GET | `/v1/dispute` | Contradictions |
+| GET | `/v1/pipes/{name}` | Run any pipe |
+| POST | `/v1/mcp` | MCP tools |
 
-Auth: `Authorization: Bearer <token>` when `.synapse/token` exists.
+Auth: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` from `.synapse/token`.
 
 ## MCP tools
 
-| Tool | Args | Behavior |
-|---|---|---|
-| `synapse.ingest` | `datasource`, `events` (array) | append events |
-| `synapse.recall` | `run_id`, `query?`, `budget_tokens?` | run `recall_context` |
-| `synapse.metrics` | `run_id?` | run `tool_failure_rate` |
+`synapse.ingest` · `synapse.remember` · `synapse.recall` · `synapse.plan` · `synapse.route` · `synapse.impact` · `synapse.metrics` · `synapse.dispute`
 
-## Module layout
+## Persistence
 
-```
-src/
-  root.zig           public exports
-  main.zig           CLI entry (process.Init)
-  core/
-    event.zig        envelope parse/validate
-    store.zig        append log + indexes
-    graph.zig        Node/Edge + materialize
-    pipe.zig         IR + executor
-    context_pack.zig token-budgeted recall
-    workspace.zig    load workspace.json + pipes
-  server/
-    http.zig         Io.net HTTP server
-    mcp.zig          JSON-RPC dispatch
-  cli/
-    commands.zig     init / dev / ingest / test
-```
+- Local: `.synapse/data/{datasource}.ndjson`
+- Graph: ephemeral materialization from filtered events
+- Cloud (roadmap): object store + columnar + branchable logs
 
-## Context pack algorithm (MVP)
+## Python SDK
 
-1. Materialize Mind + World for `run_id`
-2. Score nodes: recency + kind boost (claim > tool > file) + optional query substring match
-3. Greedily pack nodes/edges until `budget_tokens` (approx `len/4`)
-4. Emit JSON `{ nodes, edges, summary, citations }`
+`sdk/python/synapse_sdk` — thin HTTP client for all verbs.

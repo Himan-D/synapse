@@ -1,7 +1,8 @@
 {"ts":"2026-07-31T14:00:00Z","run_id":"run_demo","agent_id":"agent_1","type":"plan_step","payload":{"task_id":"diagnose_risk","name":"diagnose risk rejections"}}
 {"ts":"2026-07-31T14:00:01Z","run_id":"run_demo","agent_id":"agent_1","type":"tool_call","payload":{"name":"grep","ok":true,"args":"risk rejecting"}}
 {"ts":"2026-07-31T14:00:02Z","run_id":"run_demo","agent_id":"agent_1","type":"llm_span","payload":{"model":"grok-4.5","tokens":420}}
-{"ts":"2026-07-31T14:00:03Z","run_id":"run_demo","agent_id":"agent_1","type":"memory_write","payload":{"text":"risk service rejects orders when margin is low","content":"risk service rejects orders when margin is low"}}
+{"ts":"2026-07-31T14:00:03Z","run_id":"run_demo","agent_id":"agent_1","type":"memory_write","payload":{"text":"risk service rejects orders when margin is low","content":"risk service rejects orders when margin is low","confidence":0.95,"belief":true}}
+{"ts":"2026-07-31T14:00:03Z","run_id":"run_demo","agent_id":"agent_2","type":"memory_write","payload":{"text":"risk service accepts orders when margin is high","content":"risk service accepts orders when margin is high","confidence":0.7,"belief":true}}
 {"ts":"2026-07-31T14:00:04Z","run_id":"run_demo","agent_id":"agent_1","type":"tool_call","payload":{"name":"grep","ok":false,"args":"margin threshold"}}
 {"ts":"2026-07-31T14:00:05Z","run_id":"run_demo","agent_id":"agent_1","type":"error","payload":{"tool":"grep","message":"timeout"}}
 {"ts":"2026-07-31T14:00:06Z","run_id":"run_demo","agent_id":"agent_1","type":"tool_call","payload":{"name":"read_file","ok":true,"args":"risk.py"}}

@@ -21,12 +21,12 @@ pub fn handle(allocator: Allocator, ws: *workspace_mod.Workspace, body: []const 
 
     if (std.mem.eql(u8, method, "initialize")) {
         return try rpcResult(allocator, id_v,
-            \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.1.0"}}
+            \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.2.0"}}
         );
     }
     if (std.mem.eql(u8, method, "tools/list")) {
         return try rpcResult(allocator, id_v,
-            \\{"tools":[{"name":"synapse.ingest","description":"Ingest NDJSON events into a datasource","inputSchema":{"type":"object","properties":{"datasource":{"type":"string"},"events":{"type":"array"}},"required":["datasource","events"]}},{"name":"synapse.recall","description":"Token-budgeted context pack for a run","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"query":{"type":"string"},"budget_tokens":{"type":"number"}},"required":["run_id"]}},{"name":"synapse.metrics","description":"Tool failure rate metrics","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}}]}
+            \\{"tools":[{"name":"synapse.ingest","description":"Ingest NDJSON events into a datasource","inputSchema":{"type":"object","properties":{"datasource":{"type":"string"},"events":{"type":"array"}},"required":["datasource","events"]}},{"name":"synapse.remember","description":"Store a Mind claim with confidence","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"agent_id":{"type":"string"},"text":{"type":"string"},"confidence":{"type":"number"}},"required":["run_id","text"]}},{"name":"synapse.recall","description":"Token-budgeted context pack for a run","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"query":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.plan","description":"Plan a goal into a tool/task DAG","inputSchema":{"type":"object","properties":{"goal":{"type":"string"},"run_id":{"type":"string"}},"required":["goal"]}},{"name":"synapse.route","description":"Route a query to the best tool/skill","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"run_id":{"type":"string"}},"required":["query"]}},{"name":"synapse.impact","description":"Blast radius from errors/tools","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"},"node_id":{"type":"string"}},"required":["run_id"]}},{"name":"synapse.metrics","description":"Tool failure rate metrics","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}},{"name":"synapse.dispute","description":"Find contradictory Mind claims","inputSchema":{"type":"object","properties":{"run_id":{"type":"string"}}}}]}
         );
     }
     if (std.mem.eql(u8, method, "tools/call")) {
@@ -74,25 +74,56 @@ fn callTool(allocator: Allocator, ws: *workspace_mod.Workspace, name: []const u8
         return try out.toOwnedSlice();
     }
 
-    if (std.mem.eql(u8, name, "synapse.recall")) {
-        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
-        defer params.deinit(allocator);
+    if (std.mem.eql(u8, name, "synapse.remember")) {
         const run_id = args.object.get("run_id").?.string;
-        try params.put(allocator, "run_id", run_id);
-        if (args.object.get("query")) |q| try params.put(allocator, "query", q.string);
-        const result = try ws.runPipe("recall_context", params);
-        return result.json;
+        const agent_id = if (args.object.get("agent_id")) |a| a.string else "agent";
+        const text = args.object.get("text").?.string;
+        const confidence: f32 = if (args.object.get("confidence")) |c| switch (c) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => 0.8,
+        } else 0.8;
+        return try ws.remember(run_id, agent_id, text, confidence);
     }
 
+    if (std.mem.eql(u8, name, "synapse.recall")) {
+        return try runNamed(allocator, ws, "recall_context", args, &.{ "run_id", "query" });
+    }
+    if (std.mem.eql(u8, name, "synapse.plan")) {
+        return try runNamed(allocator, ws, "plan_goal", args, &.{ "goal", "run_id", "query" });
+    }
+    if (std.mem.eql(u8, name, "synapse.route")) {
+        return try runNamed(allocator, ws, "route_query", args, &.{ "query", "run_id" });
+    }
+    if (std.mem.eql(u8, name, "synapse.impact")) {
+        return try runNamed(allocator, ws, "blast_radius", args, &.{ "run_id", "node_id" });
+    }
     if (std.mem.eql(u8, name, "synapse.metrics")) {
-        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
-        defer params.deinit(allocator);
-        if (args.object.get("run_id")) |r| try params.put(allocator, "run_id", r.string);
-        const result = try ws.runPipe("tool_failure_rate", params);
-        return result.json;
+        return try runNamed(allocator, ws, "tool_failure_rate", args, &.{"run_id"});
+    }
+    if (std.mem.eql(u8, name, "synapse.dispute")) {
+        return try runNamed(allocator, ws, "find_contradictions", args, &.{"run_id"});
     }
 
     return error.UnknownTool;
+}
+
+fn runNamed(
+    allocator: Allocator,
+    ws: *workspace_mod.Workspace,
+    pipe_name: []const u8,
+    args: std.json.Value,
+    keys: []const []const u8,
+) ![]u8 {
+    var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer params.deinit(allocator);
+    for (keys) |k| {
+        if (args.object.get(k)) |v| {
+            try params.put(allocator, k, v.string);
+        }
+    }
+    const result = try ws.runPipe(pipe_name, params);
+    return result.json;
 }
 
 fn rpcResult(allocator: Allocator, id_v: ?std.json.Value, result_json: []const u8) ![]u8 {

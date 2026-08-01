@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const pipe_mod = @import("pipe.zig");
+const belief_mod = @import("belief.zig");
 
 pub const Workspace = struct {
     allocator: Allocator,
@@ -65,12 +66,38 @@ pub const Workspace = struct {
         var pipes_dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const pipes_dir = try std.fmt.bufPrint(&pipes_dir_buf, "{s}/pipes", .{self.root});
 
-        // Load known example pipe files by scanning via a simple convention:
-        // read directory entries using openDir if available; else try fixed names.
+        var dir = Io.Dir.cwd().openDir(self.io, pipes_dir, .{ .iterate = true }) catch {
+            // Fallback to known names if pipes dir missing/unreadable
+            try self.loadKnownPipes(pipes_dir);
+            return;
+        };
+        defer dir.close(self.io);
+
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".pipe.json")) continue;
+            var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ pipes_dir, entry.name });
+            var pipe = try pipe_mod.loadPipeFile(self.allocator, self.io, path);
+            const name_owned = try self.allocator.dupe(u8, pipe.name);
+            if (self.pipes.fetchSwapRemove(name_owned)) |old| {
+                self.allocator.free(old.key);
+                var old_pipe = old.value;
+                old_pipe.deinit();
+            }
+            try self.pipes.put(self.allocator, name_owned, pipe);
+        }
+    }
+
+    fn loadKnownPipes(self: *Workspace, pipes_dir: []const u8) !void {
         const known = [_][]const u8{
             "recall_context.pipe.json",
             "tool_failure_rate.pipe.json",
             "blast_radius.pipe.json",
+            "plan_goal.pipe.json",
+            "route_query.pipe.json",
+            "find_contradictions.pipe.json",
         };
         for (known) |fname| {
             var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -88,6 +115,28 @@ pub const Workspace = struct {
         return self.pipes.getPtr(name);
     }
 
+    pub fn listPipesJson(self: *Workspace, allocator: Allocator) ![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.writeAll("{\"workspace\":");
+        try aw.writer.print("{f}", .{std.json.fmt(self.name, .{})});
+        try aw.writer.writeAll(",\"pipes\":[");
+        var first = true;
+        var it = self.pipes.iterator();
+        while (it.next()) |e| {
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            const path = e.value_ptr.endpoint_path orelse "";
+            try aw.writer.print(
+                \\{{"name":{f},"endpoint":{f}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), std.json.fmt(path, .{}) },
+            );
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
     pub fn runPipe(
         self: *Workspace,
         name: []const u8,
@@ -95,6 +144,40 @@ pub const Workspace = struct {
     ) !pipe_mod.PipeResult {
         const pipe = self.getPipe(name) orelse return error.PipeNotFound;
         return pipe_mod.execute(self.allocator, &self.store, pipe, params);
+    }
+
+    pub fn remember(
+        self: *Workspace,
+        run_id: []const u8,
+        agent_id: []const u8,
+        text: []const u8,
+        confidence: f32,
+    ) ![]u8 {
+        const ts = "2026-08-01T00:00:00Z";
+        const line = try belief_mod.rememberEventJson(self.allocator, run_id, agent_id, text, confidence, ts);
+        defer self.allocator.free(line);
+        _ = try self.store.ingestNdjson("harness_events", line);
+        _ = try self.store.ingestNdjson("memory_writes", line);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        try aw.writer.print(
+            \\{{"remembered":true,"run_id":{f},"text":{f},"confidence":{d:.3}}}
+        ,
+            .{ std.json.fmt(run_id, .{}), std.json.fmt(text, .{}), confidence },
+        );
+        return try aw.toOwnedSlice();
+    }
+
+    pub fn checkBearer(self: *Workspace, head_buffer: []const u8) bool {
+        const token = self.token orelse return true; // no token configured → open
+        // Require Authorization header when token is set
+        if (std.mem.indexOf(u8, head_buffer, "Authorization:") == null and
+            std.mem.indexOf(u8, head_buffer, "authorization:") == null)
+        {
+            // Allow health without auth
+            return false;
+        }
+        return std.mem.indexOf(u8, head_buffer, token) != null;
     }
 };
 
@@ -127,7 +210,6 @@ pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []con
     const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = token_path, .data = token });
 
-    // Seed datasources metadata + default pipes
     try writeDefaultDatasources(io, root);
     try writeDefaultPipes(io, root);
 }
@@ -147,47 +229,83 @@ fn writeDefaultDatasources(io: Io, root: []const u8) !void {
 }
 
 fn writeDefaultPipes(io: Io, root: []const u8) !void {
-    const recall =
-        \\{
-        \\  "name": "recall_context",
-        \\  "nodes": [
-        \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
-        \\    { "type": "materialize_graph", "layers": ["mind", "world", "work"] },
-        \\    { "type": "project", "op": "context_pack", "budget_tokens": 4000 }
-        \\  ],
-        \\  "endpoint": { "path": "/v1/recall", "params": ["run_id", "query"] }
-        \\}
-        \\
-    ;
-    const metrics =
-        \\{
-        \\  "name": "tool_failure_rate",
-        \\  "nodes": [
-        \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "tool_call" } },
-        \\    { "type": "aggregate", "op": "rate", "group_by": "name", "success_field": "ok" }
-        \\  ],
-        \\  "endpoint": { "path": "/v1/metrics/tool_failure_rate", "params": ["run_id"] }
-        \\}
-        \\
-    ;
-    const blast =
-        \\{
-        \\  "name": "blast_radius",
-        \\  "nodes": [
-        \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
-        \\    { "type": "materialize_graph", "layers": ["world", "work"] },
-        \\    { "type": "project", "op": "blast_radius" }
-        \\  ],
-        \\  "endpoint": { "path": "/v1/impact", "params": ["run_id", "node_id"] }
-        \\}
-        \\
-    ;
+    const files = [_]struct { []const u8, []const u8 }{
+        .{ "recall_context.pipe.json",
+            \\{
+            \\  "name": "recall_context",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+            \\    { "type": "materialize_graph", "layers": ["mind", "world", "work"] },
+            \\    { "type": "project", "op": "context_pack", "budget_tokens": 4000 }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/recall", "params": ["run_id", "query"] }
+            \\}
+            \\
+        },
+        .{ "tool_failure_rate.pipe.json",
+            \\{
+            \\  "name": "tool_failure_rate",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "tool_call" } },
+            \\    { "type": "aggregate", "op": "rate", "group_by": "name", "success_field": "ok" }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/metrics/tool_failure_rate", "params": ["run_id"] }
+            \\}
+            \\
+        },
+        .{ "blast_radius.pipe.json",
+            \\{
+            \\  "name": "blast_radius",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+            \\    { "type": "materialize_graph", "layers": ["world", "work"] },
+            \\    { "type": "project", "op": "blast_radius" }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/impact", "params": ["run_id", "node_id"] }
+            \\}
+            \\
+        },
+        .{ "plan_goal.pipe.json",
+            \\{
+            \\  "name": "plan_goal",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+            \\    { "type": "materialize_graph", "layers": ["world", "work"] },
+            \\    { "type": "project", "op": "plan" }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/plan", "params": ["goal", "run_id"] }
+            \\}
+            \\
+        },
+        .{ "route_query.pipe.json",
+            \\{
+            \\  "name": "route_query",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+            \\    { "type": "materialize_graph", "layers": ["world", "work"] },
+            \\    { "type": "project", "op": "route" }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/route", "params": ["query", "run_id"] }
+            \\}
+            \\
+        },
+        .{ "find_contradictions.pipe.json",
+            \\{
+            \\  "name": "find_contradictions",
+            \\  "nodes": [
+            \\    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+            \\    { "type": "materialize_graph", "layers": ["mind"] },
+            \\    { "type": "project", "op": "contradict" }
+            \\  ],
+            \\  "endpoint": { "path": "/v1/dispute", "params": ["run_id"] }
+            \\}
+            \\
+        },
+    };
 
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const p1 = try std.fmt.bufPrint(&path_buf, "{s}/pipes/recall_context.pipe.json", .{root});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p1, .data = recall });
-    const p2 = try std.fmt.bufPrint(&path_buf, "{s}/pipes/tool_failure_rate.pipe.json", .{root});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p2, .data = metrics });
-    const p3 = try std.fmt.bufPrint(&path_buf, "{s}/pipes/blast_radius.pipe.json", .{root});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p3, .data = blast });
+    for (files) |f| {
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/pipes/{s}", .{ root, f[0] });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f[1] });
+    }
 }

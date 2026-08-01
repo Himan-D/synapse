@@ -1,0 +1,9 @@
+{
+  "name": "route_query",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["world", "work"] },
+    { "type": "project", "op": "route" }
+  ],
+  "endpoint": { "path": "/v1/route", "params": ["query", "run_id"] }
+}

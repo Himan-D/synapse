@@ -44,6 +44,21 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         std.log.info("ingested {d} events into {s} (replace={any})", .{ n, ds, replace });
         return;
     }
+    if (std.mem.eql(u8, cmd, "remember")) {
+        if (args.len < 3) return error.Usage;
+        const text = args[2];
+        const root = flagOr(args, "--root", ".");
+        const run_id = flagOr(args, "--run-id", "run_demo");
+        const agent_id = flagOr(args, "--agent", "agent");
+        const conf_s = flagOr(args, "--confidence", "0.9");
+        const confidence = try std.fmt.parseFloat(f32, conf_s);
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.remember(run_id, agent_id, text, confidence);
+        defer allocator.free(json);
+        std.debug.print("{s}\n", .{json});
+        return;
+    }
     if (std.mem.eql(u8, cmd, "test")) {
         const root = flagOr(args, "--root", ".");
         try runWorkspaceTests(allocator, io, root);
@@ -60,7 +75,6 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         var params: std.StringHashMapUnmanaged([]const u8) = .empty;
         defer params.deinit(allocator);
-        // parse trailing k=v
         for (args[4..]) |a| {
             if (std.mem.startsWith(u8, a, "--")) continue;
             const eq = std.mem.indexOfScalar(u8, a, '=') orelse continue;
@@ -98,14 +112,18 @@ fn flagOr(args: []const []const u8, flag: []const u8, default: []const u8) []con
 
 fn printHelp() !void {
     const help =
-        \\synapse — Tinybird for AI harnesses
+        \\synapse — Tinybird for AI harnesses (full product surface)
         \\
         \\Usage:
         \\  synapse init [dir] [name]
         \\  synapse dev --root <dir> --port <port>
-        \\  synapse ingest <datasource> <file.ndjson> --root <dir>
+        \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
+        \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
         \\  synapse pipe run <name> --root <dir> [--run-id <id>] [k=v...]
         \\  synapse test --root <dir>
+        \\
+        \\Env:
+        \\  SYNAPSE_REQUIRE_AUTH=1   enforce Bearer token from .synapse/token
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -115,7 +133,6 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
     var ws = try workspace_mod.Workspace.load(allocator, io, root);
     defer ws.deinit();
 
-    // Load sample events once if the harness_events table is empty.
     if (ws.store.events("harness_events").len == 0) {
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const sample_path = try std.fmt.bufPrint(&buf, "{s}/sample_events.ndjson", .{root});
@@ -129,6 +146,7 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
     defer params.deinit(allocator);
     try params.put(allocator, "run_id", "run_demo");
     try params.put(allocator, "query", "risk");
+    try params.put(allocator, "goal", "fix risk bug and run tests");
 
     var recall = try ws.runPipe("recall_context", params);
     defer recall.deinit();
@@ -144,6 +162,27 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
     defer blast.deinit();
     if (std.mem.indexOf(u8, blast.json, "impacted") == null) return error.BlastFailed;
     std.log.info("blast_radius OK ({d} bytes)", .{blast.json.len});
+
+    if (ws.getPipe("plan_goal")) |_| {
+        var plan = try ws.runPipe("plan_goal", params);
+        defer plan.deinit();
+        if (std.mem.indexOf(u8, plan.json, "steps") == null) return error.PlanFailed;
+        std.log.info("plan_goal OK ({d} bytes)", .{plan.json.len});
+    }
+
+    if (ws.getPipe("route_query")) |_| {
+        var route = try ws.runPipe("route_query", params);
+        defer route.deinit();
+        if (std.mem.indexOf(u8, route.json, "choice") == null) return error.RouteFailed;
+        std.log.info("route_query OK ({d} bytes)", .{route.json.len});
+    }
+
+    if (ws.getPipe("find_contradictions")) |_| {
+        var dispute = try ws.runPipe("find_contradictions", params);
+        defer dispute.deinit();
+        if (std.mem.indexOf(u8, dispute.json, "disputes") == null) return error.DisputeFailed;
+        std.log.info("find_contradictions OK ({d} bytes)", .{dispute.json.len});
+    }
 
     std.log.info("all workspace tests passed", .{});
 }
