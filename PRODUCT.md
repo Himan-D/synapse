@@ -272,12 +272,13 @@ One write path → memory **and** metrics. No dual instrumentation.
 | Workspace · datasources · NDJSON ingest | **Shipped** |
 | Pipe IR: filter / aggregate / materialize / project | **Shipped** |
 | recall · metrics · impact | **Shipped** |
-| HTTP + MCP (`ingest`, `recall`, `metrics`) | **Shipped** |
-| CLI init/dev/ingest/pipe/test | **Shipped** |
-| plan · route engines | **In product build** |
-| believe / dispute / decay | **In product build** |
-| Dynamic pipe directory scan · Bearer auth | **In product build** |
-| Python SDK | **In product build** |
+| plan · route · remember · dispute | **Shipped** |
+| HTTP + MCP (full verb surface) | **Shipped** |
+| CLI init/dev/ingest/remember/pipe/test | **Shipped** |
+| Dynamic pipe directory scan | **Shipped** |
+| Bearer auth (`SYNAPSE_REQUIRE_AUTH=1`) | **Shipped** |
+| Python SDK (`sdk/python`) | **Shipped** |
+| Confidence-weighted recall | **Shipped** |
 | embed hybrid retrieval | Interface + stub |
 | Cloud multi-tenant · SQL pipes · UI | Roadmap |
 | Hypergraphs · CRDT merge · GNN | Research |

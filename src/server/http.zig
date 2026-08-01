@@ -47,8 +47,9 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
 
     // Optional Bearer auth: set SYNAPSE_REQUIRE_AUTH=1 to enforce workspace token.
     const require_auth = blk: {
-        if (std.posix.getenv("SYNAPSE_REQUIRE_AUTH")) |v| {
-            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        if (std.c.getenv("SYNAPSE_REQUIRE_AUTH")) |v| {
+            const s = std.mem.span(v);
+            break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
         }
         break :blk false;
     };

@@ -132,7 +132,9 @@ pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod
             if (!allRequires(&have, tool.requires)) continue;
             // skip if all provides already had
             var new_prov = false;
-            for (tool.provides) |p| if (!hasFact(&have, p)) new_prov = true;
+            for (tool.provides) |p| {
+                if (!hasFact(&have, p)) new_prov = true;
+            }
             if (!new_prov) continue;
             picked = tool;
             break;

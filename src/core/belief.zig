@@ -108,15 +108,6 @@ pub fn findContradictions(allocator: Allocator, graph: *const graph_mod.Graph) !
     var claims: std.ArrayList(graph_mod.Node) = .empty;
     defer claims.deinit(allocator);
     for (values) |n| {
-        if (std.mem.eql(u8, n.kind, "claim") or std.mem.eql(u8, n.layer.toString(), "mind") and std.mem.eql(u8, n.kind, "claim")) {
-            try claims.append(allocator, n);
-        } else if (std.mem.eql(u8, n.kind, "claim")) {
-            try claims.append(allocator, n);
-        }
-    }
-    // simpler: all claim kinds
-    claims.clearRetainingCapacity();
-    for (values) |n| {
         if (std.mem.eql(u8, n.kind, "claim")) try claims.append(allocator, n);
     }
 

@@ -79,7 +79,7 @@ pub const Workspace = struct {
             if (!std.mem.endsWith(u8, entry.name, ".pipe.json")) continue;
             var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
             const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ pipes_dir, entry.name });
-            var pipe = try pipe_mod.loadPipeFile(self.allocator, self.io, path);
+            const pipe = try pipe_mod.loadPipeFile(self.allocator, self.io, path);
             const name_owned = try self.allocator.dupe(u8, pipe.name);
             if (self.pipes.fetchSwapRemove(name_owned)) |old| {
                 self.allocator.free(old.key);
@@ -153,7 +153,8 @@ pub const Workspace = struct {
         text: []const u8,
         confidence: f32,
     ) ![]u8 {
-        const ts = "2026-08-01T00:00:00Z";
+        const ts = try formatUtcNow(self.allocator, self.io);
+        defer self.allocator.free(ts);
         const line = try belief_mod.rememberEventJson(self.allocator, run_id, agent_id, text, confidence, ts);
         defer self.allocator.free(line);
         _ = try self.store.ingestNdjson("harness_events", line);
@@ -180,6 +181,27 @@ pub const Workspace = struct {
         return std.mem.indexOf(u8, head_buffer, token) != null;
     }
 };
+
+fn formatUtcNow(allocator: Allocator, io: Io) ![]u8 {
+    const secs_i = Io.Clock.real.now(io).toSeconds();
+    const secs: u64 = @intCast(@max(secs_i, 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return try std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            yd.year,
+            md.month.numeric(),
+            @as(u8, md.day_index) + 1,
+            ds.getHoursIntoDay(),
+            ds.getMinutesIntoHour(),
+            ds.getSecondsIntoMinute(),
+        },
+    );
+}
 
 pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []const u8) !void {
     try Io.Dir.cwd().createDirPath(io, root);
