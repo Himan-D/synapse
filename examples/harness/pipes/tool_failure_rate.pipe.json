@@ -1,0 +1,8 @@
+{
+  "name": "tool_failure_rate",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "tool_call" } },
+    { "type": "aggregate", "op": "rate", "group_by": "name", "success_field": "ok" }
+  ],
+  "endpoint": { "path": "/v1/metrics/tool_failure_rate", "params": ["run_id"] }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "blast_radius",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["world", "work"] },
+    { "type": "project", "op": "blast_radius" }
+  ],
+  "endpoint": { "path": "/v1/impact", "params": ["run_id", "node_id"] }
+}

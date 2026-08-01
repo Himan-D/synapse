@@ -1,0 +1,9 @@
+{
+  "name": "recall_context",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}" } },
+    { "type": "materialize_graph", "layers": ["mind", "world", "work"] },
+    { "type": "project", "op": "context_pack", "budget_tokens": 4000 }
+  ],
+  "endpoint": { "path": "/v1/recall", "params": ["run_id", "query"] }
+}
