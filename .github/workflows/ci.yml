@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  zig:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16
+        run: |
+          brew install zig
+          zig version
+      - name: Unit tests
+        run: zig build test
+      - name: Build
+        run: zig build
+      - name: Workspace tests
+        run: ./zig-out/bin/synapse test --root examples/harness
+      - name: E2E
+        run: ./scripts/e2e.sh

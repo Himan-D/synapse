@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const graph_mod = @import("graph.zig");
 
 pub const Tool = struct {
@@ -10,7 +11,25 @@ pub const Tool = struct {
     cost_latency_ms: u32 = 200,
 };
 
-/// Built-in tool catalog for harness planning (extend via workspace later).
+pub const ToolCatalog = struct {
+    allocator: Allocator,
+    tools: []Tool,
+    /// Owned string storage for requires/provides/name.
+    arena_strings: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *ToolCatalog) void {
+        for (self.tools) |t| {
+            self.allocator.free(t.requires);
+            self.allocator.free(t.provides);
+        }
+        self.allocator.free(self.tools);
+        for (self.arena_strings.items) |s| self.allocator.free(s);
+        self.arena_strings.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Built-in tool catalog for harness planning.
 pub const default_tools = [_]Tool{
     .{
         .name = "grep",
@@ -49,6 +68,113 @@ pub const default_tools = [_]Tool{
     },
 };
 
+/// Load `{root}/tools.json` if present. Caller owns catalog.
+pub fn loadToolsFile(allocator: Allocator, io: Io, root: []const u8) !ToolCatalog {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/tools.json", .{root});
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch {
+        // Fallback: copy default_tools into owned catalog
+        return try catalogFromDefaults(allocator);
+    };
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("tools") orelse return try catalogFromDefaults(allocator);
+
+    var cat: ToolCatalog = .{ .allocator = allocator, .tools = &.{} };
+    errdefer cat.deinit();
+
+    var tools: std.ArrayList(Tool) = .empty;
+    errdefer {
+        for (tools.items) |t| {
+            allocator.free(t.requires);
+            allocator.free(t.provides);
+        }
+        tools.deinit(allocator);
+    }
+
+    for (arr.array.items) |item| {
+        const obj = item.object;
+        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        try cat.arena_strings.append(allocator, name);
+
+        var reqs: std.ArrayList([]const u8) = .empty;
+        if (obj.get("requires")) |r| {
+            for (r.array.items) |rv| {
+                const s = try allocator.dupe(u8, rv.string);
+                try cat.arena_strings.append(allocator, s);
+                try reqs.append(allocator, s);
+            }
+        }
+        var prov: std.ArrayList([]const u8) = .empty;
+        if (obj.get("provides")) |p| {
+            for (p.array.items) |pv| {
+                const s = try allocator.dupe(u8, pv.string);
+                try cat.arena_strings.append(allocator, s);
+                try prov.append(allocator, s);
+            }
+        }
+        const cost_tokens: u32 = if (obj.get("cost_tokens")) |c| switch (c) {
+            .integer => |i| @intCast(i),
+            else => 1000,
+        } else 1000;
+        const cost_latency_ms: u32 = if (obj.get("cost_latency_ms")) |c| switch (c) {
+            .integer => |i| @intCast(i),
+            else => 200,
+        } else 200;
+
+        try tools.append(allocator, .{
+            .name = name,
+            .requires = try reqs.toOwnedSlice(allocator),
+            .provides = try prov.toOwnedSlice(allocator),
+            .cost_tokens = cost_tokens,
+            .cost_latency_ms = cost_latency_ms,
+        });
+    }
+
+    cat.tools = try tools.toOwnedSlice(allocator);
+    return cat;
+}
+
+fn catalogFromDefaults(allocator: Allocator) !ToolCatalog {
+    var cat: ToolCatalog = .{ .allocator = allocator, .tools = &.{} };
+    var tools: std.ArrayList(Tool) = .empty;
+    errdefer {
+        for (tools.items) |t| {
+            allocator.free(t.requires);
+            allocator.free(t.provides);
+        }
+        tools.deinit(allocator);
+        cat.deinit();
+    }
+    for (default_tools) |t| {
+        const name = try allocator.dupe(u8, t.name);
+        try cat.arena_strings.append(allocator, name);
+        var reqs: std.ArrayList([]const u8) = .empty;
+        for (t.requires) |r| {
+            const s = try allocator.dupe(u8, r);
+            try cat.arena_strings.append(allocator, s);
+            try reqs.append(allocator, s);
+        }
+        var prov: std.ArrayList([]const u8) = .empty;
+        for (t.provides) |p| {
+            const s = try allocator.dupe(u8, p);
+            try cat.arena_strings.append(allocator, s);
+            try prov.append(allocator, s);
+        }
+        try tools.append(allocator, .{
+            .name = name,
+            .requires = try reqs.toOwnedSlice(allocator),
+            .provides = try prov.toOwnedSlice(allocator),
+            .cost_tokens = t.cost_tokens,
+            .cost_latency_ms = t.cost_latency_ms,
+        });
+    }
+    cat.tools = try tools.toOwnedSlice(allocator);
+    return cat;
+}
+
 /// Goal keywords → desired provides.
 fn goalProvides(allocator: Allocator, goal: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
@@ -86,14 +212,30 @@ fn allRequires(have: *const std.StringArrayHashMapUnmanaged(void), reqs: []const
     return true;
 }
 
-/// Plan a goal against the default tool catalog (+ optional graph tools).
-/// Returns owned JSON.
-pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod.Graph) ![]u8 {
-    _ = graph; // reserved: seed have-set from World/Work nodes
-    var have: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer have.deinit(allocator);
+fn seedHaveFromGraph(have: *std.StringArrayHashMapUnmanaged(void), allocator: Allocator, graph: ?*const graph_mod.Graph) !void {
     try have.put(allocator, "codebase", {});
     try have.put(allocator, "path", {});
+    if (graph) |g| {
+        for (g.nodes.values()) |n| {
+            if (std.mem.eql(u8, n.kind, "tool") or std.mem.eql(u8, n.kind, "file")) {
+                // Presence of tools/files implies we can search/read.
+                try have.put(allocator, "codebase", {});
+                try have.put(allocator, "path", {});
+            }
+            if (std.mem.eql(u8, n.kind, "tool_op")) {
+                try have.put(allocator, "search_hits", {});
+            }
+        }
+    }
+}
+
+/// Plan a goal against a tool catalog (+ optional graph seeding).
+pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod.Graph, tools: []const Tool) ![]u8 {
+    var have: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer have.deinit(allocator);
+    try seedHaveFromGraph(&have, allocator, graph);
+
+    const catalog = if (tools.len > 0) tools else default_tools[0..];
 
     const targets = try goalProvides(allocator, goal);
     defer allocator.free(targets);
@@ -116,21 +258,18 @@ pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod
         if (!unmet) break;
 
         var picked: ?Tool = null;
-        for (default_tools) |tool| {
-            // Prefer tools that provide something still missing and whose requires are satisfied.
+        for (catalog) |tool| {
             var useful = false;
             for (tool.provides) |p| {
                 if (!hasFact(&have, p)) {
                     for (targets) |t| {
                         if (std.mem.eql(u8, p, t)) useful = true;
                     }
-                    // also allow intermediate provides
                     if (!useful) useful = true;
                 }
             }
             if (!useful) continue;
             if (!allRequires(&have, tool.requires)) continue;
-            // skip if all provides already had
             var new_prov = false;
             for (tool.provides) |p| {
                 if (!hasFact(&have, p)) new_prov = true;
@@ -152,7 +291,7 @@ pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    try aw.writer.print("{{\"goal\":{f},\"steps\":[", .{std.json.fmt(goal, .{})});
+    try aw.writer.print("{{\"goal\":{f},\"tools_used\":{d},\"steps\":[", .{ std.json.fmt(goal, .{}), catalog.len });
     for (steps.items, 0..) |s, i| {
         if (i > 0) try aw.writer.writeAll(",");
         try aw.writer.print("{{\"id\":\"step:{d}\",\"tool\":{f},\"provides\":[", .{ i, std.json.fmt(s.name, .{}) });
@@ -180,7 +319,7 @@ pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod
 }
 
 test "planGoal produces steps for fix+test" {
-    const json = try planGoal(std.testing.allocator, "fix risk bug and run tests", null);
+    const json = try planGoal(std.testing.allocator, "fix risk bug and run tests", null, &.{});
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "steps") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "grep") != null or std.mem.indexOf(u8, json, "read_file") != null);

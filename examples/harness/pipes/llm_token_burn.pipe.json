@@ -1,0 +1,10 @@
+{
+  "name": "llm_token_burn",
+  "type": "endpoint",
+  "description": "Sum LLM tokens by model",
+  "nodes": [
+    { "type": "filter", "datasource": "harness_events", "where": { "run_id": "{{run_id}}", "type": "llm_span" } },
+    { "type": "aggregate", "op": "sum", "group_by": "model", "sum_field": "tokens" }
+  ],
+  "endpoint": { "path": "/v1/metrics/llm_tokens", "params": ["run_id"] }
+}

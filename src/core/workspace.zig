@@ -117,6 +117,7 @@ pub const Workspace = struct {
             "diff_run.pipe.json",
             "embed_recall.pipe.json",
             "consolidate_claims.pipe.json",
+            "llm_token_burn.pipe.json",
         };
         for (known) |fname| {
             var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;

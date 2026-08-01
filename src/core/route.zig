@@ -24,11 +24,12 @@ fn scoreTool(query: []const u8, tool: plan_mod.Tool) f32 {
 }
 
 /// Route a query to the best tool/skill/agent. Returns owned JSON.
-pub fn routeQuery(allocator: Allocator, query: []const u8, graph: ?*const graph_mod.Graph) ![]u8 {
+pub fn routeQuery(allocator: Allocator, query: []const u8, graph: ?*const graph_mod.Graph, tools: []const plan_mod.Tool) ![]u8 {
     var cands: std.ArrayList(Candidate) = .empty;
     defer cands.deinit(allocator);
 
-    for (plan_mod.default_tools) |tool| {
+    const catalog = if (tools.len > 0) tools else plan_mod.default_tools[0..];
+    for (catalog) |tool| {
         try cands.append(allocator, .{
             .name = tool.name,
             .kind = "tool",
@@ -85,7 +86,7 @@ pub fn routeQuery(allocator: Allocator, query: []const u8, graph: ?*const graph_
 }
 
 test "routeQuery prefers grep for search query" {
-    const json = try routeQuery(std.testing.allocator, "search codebase with grep for risk", null);
+    const json = try routeQuery(std.testing.allocator, "search codebase with grep for risk", null, &.{});
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "grep") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "choice") != null);

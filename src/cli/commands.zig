@@ -4,6 +4,7 @@ const Io = std.Io;
 const workspace_mod = @import("../core/workspace.zig");
 const http_mod = @import("../server/http.zig");
 const validate_mod = @import("../core/validate.zig");
+const mcp_mod = @import("../server/mcp.zig");
 
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (args.len < 2) {
@@ -95,6 +96,13 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer report.deinit();
         std.debug.print("{{\"deploy\":\"local-validate\",\"report\":{s}}}\n", .{report.json});
         if (!report.ok) return error.BuildFailed;
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        const root = flagOr(args, "--root", ".");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        try runMcpStdio(allocator, io, &ws);
         return;
     }
     if (std.mem.eql(u8, cmd, "dev")) {
@@ -256,6 +264,28 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
     return error.Usage;
 }
 
+fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void {
+    // Line-delimited JSON-RPC over stdin/stdout for Cursor / Claude Desktop.
+    var stdin_buf: [64 * 1024]u8 = undefined;
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var in_reader = Io.File.stdin().reader(io, &stdin_buf);
+    var out_writer = Io.File.stdout().writer(io, &stdout_buf);
+
+    while (true) {
+        const line = in_reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const resp = try mcp_mod.handle(allocator, ws, trimmed);
+        defer allocator.free(resp);
+        try out_writer.interface.writeAll(resp);
+        try out_writer.interface.writeAll("\n");
+        try out_writer.interface.flush();
+    }
+}
+
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
     return false;
@@ -286,6 +316,7 @@ fn printHelp() !void {
         \\  synapse checkpoint --name <id> --root <dir>
         \\  synapse graph --root <dir> --run-id <id>
         \\  synapse deploy --root <dir>
+        \\  synapse mcp --root <dir>
         \\  synapse dev --root <dir> --port <port>
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
@@ -392,6 +423,14 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
         defer cons.deinit();
         if (std.mem.indexOf(u8, cons.json, "clusters") == null) return error.ConsolidateFailed;
         std.log.info("consolidate_claims OK ({d} bytes)", .{cons.json.len});
+    }
+
+    if (ws.getPipe("llm_token_burn")) |_| {
+        var llm = try ws.runPipe("llm_token_burn", params);
+        defer llm.deinit();
+        if (std.mem.indexOf(u8, llm.json, "sum") == null and std.mem.indexOf(u8, llm.json, "groups") == null)
+            return error.LlmMetricsFailed;
+        std.log.info("llm_token_burn OK ({d} bytes)", .{llm.json.len});
     }
 
     const gjson = try ws.graphJson(allocator, "run_demo");

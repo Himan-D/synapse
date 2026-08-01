@@ -1,1 +1,7 @@
-{"name":"harness_events","format":"ndjson"}
+{
+  "name": "harness_events",
+  "format": "ndjson",
+  "schema": {
+    "required": ["ts", "run_id", "agent_id", "type", "payload"]
+  }
+}

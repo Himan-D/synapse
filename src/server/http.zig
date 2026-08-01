@@ -199,6 +199,9 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
     if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/tool_failure_rate")) {
         return runAlias(allocator, &request, ws, "tool_failure_rate", target, null);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/llm_tokens")) {
+        return runAlias(allocator, &request, ws, "llm_token_burn", target, null);
+    }
     if (method == .GET and std.mem.eql(u8, path, "/v1/impact")) {
         return runAlias(allocator, &request, ws, "blast_radius", target, null);
     }

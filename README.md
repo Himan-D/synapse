@@ -55,7 +55,11 @@ Or run the bundled script:
 | `synapse workspace --root <dir>` | List pipes + types |
 | `synapse endpoint --root <dir>` | List published endpoints |
 | `synapse token show\|create [name]` | Admin / scoped tokens |
-| `synapse dev --root <dir> --port <n>` | Serve HTTP + MCP |
+| `synapse mcp --root <dir>` | MCP over stdio (Cursor / Claude Desktop) |
+| `synapse branch create <name>` | Snapshot local event data |
+| `synapse graph --run-id <id>` | Inspect World/Work/Mind |
+| `synapse deploy --root <dir>` | Local validate (cloud promote later) |
+| `synapse dev --root <dir> --port <n>` | Serve HTTP + MCP + playground |
 | `synapse ingest <ds> <file.ndjson> --root <dir> [--replace]` | Append (or replace) events |
 | `synapse remember "<text>" --root <dir> --run-id <id>` | Write a Mind claim |
 | `synapse pipe run <name> --root <dir> --run-id <id>` | Run a pipe offline |

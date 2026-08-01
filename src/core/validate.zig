@@ -58,9 +58,38 @@ pub fn buildWorkspace(allocator: Allocator, io: Io, root: []const u8) !BuildRepo
             if (parsed.value != .object or parsed.value.object.get("name") == null) {
                 try errors.append(allocator, try std.fmt.allocPrint(allocator, "datasource {s} missing name", .{entry.name}));
             }
+            // Optional schema: required envelope fields
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("schema")) |schema| {
+                    if (schema != .object) {
+                        try errors.append(allocator, try std.fmt.allocPrint(allocator, "datasource {s} schema must be object", .{entry.name}));
+                    } else if (schema.object.get("required")) |req| {
+                        if (req != .array) {
+                            try errors.append(allocator, try std.fmt.allocPrint(allocator, "datasource {s} schema.required must be array", .{entry.name}));
+                        } else {
+                            for (req.array.items) |field| {
+                                if (field != .string) {
+                                    try errors.append(allocator, try std.fmt.allocPrint(allocator, "datasource {s} schema.required entries must be strings", .{entry.name}));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    try warnings.append(allocator, try std.fmt.allocPrint(allocator, "datasource {s} has no schema (recommended)", .{entry.name}));
+                }
+            }
         }
     } else |_| {
         try warnings.append(allocator, try allocator.dupe(u8, "no datasources/ directory"));
+    }
+
+    // tools.json presence
+    const tools_path = try std.fmt.bufPrint(&path_buf, "{s}/tools.json", .{root});
+    if (Io.Dir.cwd().access(io, tools_path, .{})) |_| {
+        // ok
+    } else |_| {
+        try warnings.append(allocator, try allocator.dupe(u8, "no tools.json — plan/route will use built-in catalog"));
     }
 
     // Pipes

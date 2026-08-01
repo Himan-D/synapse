@@ -54,6 +54,10 @@ echo "==> metrics HTTP"
 curl -sf "http://127.0.0.1:8787/v1/metrics/tool_failure_rate?run_id=run_demo"
 echo
 
+echo "==> llm tokens HTTP"
+curl -sf "http://127.0.0.1:8787/v1/metrics/llm_tokens?run_id=run_demo"
+echo
+
 echo "==> remember HTTP"
 curl -sf -X POST "http://127.0.0.1:8787/v1/remember" \
   -H "content-type: application/json" \

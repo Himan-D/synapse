@@ -24,10 +24,12 @@ Synapse is **Tinybird-shaped for AI harnesses**: same DX loop (Datasource → Pi
 | CLI `tb build` | `synapse build` | Shipped |
 | CLI `tb endpoint` | `synapse endpoint` | Shipped |
 | CLI workspace / token | `synapse workspace` / `synapse token` | Shipped |
-| Playgrounds / UI | — | Roadmap |
+| Playgrounds / UI | `GET /` local playground | Shipped |
 | ClickHouse interface | — | Out of scope |
-| MCP | `POST /v1/mcp` | Shipped |
-| Python / TS SDKs | Python shipped; TS roadmap | Partial |
+| MCP | `POST /v1/mcp` + `synapse mcp` stdio | Shipped |
+| Python / TS SDKs | Both shipped under `sdk/` | Shipped |
+| Tool catalog file | `tools.json` for plan/route | Shipped |
+| Webhook sink | outbox under `.synapse/webhooks/` | Shipped (queued) |
 
 ## Intentional differences
 

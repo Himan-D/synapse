@@ -290,6 +290,10 @@ One write path → memory **and** metrics. No dual instrumentation.
 | Graph inspect API · playground UI | **Shipped** |
 | Local branches · `synapse deploy` validate | **Shipped** (local stubs) |
 | TypeScript SDK + Python pipe DSL / instrument | **Shipped** |
+| `tools.json` catalog for plan/route | **Shipped** |
+| Aggregate ops count / rate / sum · LLM token metrics | **Shipped** |
+| Webhook sink outbox · MCP stdio CLI | **Shipped** |
+| Datasource schema checks · GitHub CI · LICENSE | **Shipped** |
 | Cloud multi-tenant · SQL pipes · JWT · Kafka | Roadmap |
 | Hypergraphs · CRDT merge · GNN | Research |
 

@@ -6,11 +6,13 @@ zig-out/
 .synapse/tokens.json
 .synapse/checkpoints/
 .synapse/branches/
+.synapse/webhooks/
 examples/**/.synapse/data/
 examples/**/.synapse/exports/
 examples/**/.synapse/tokens.json
 examples/**/.synapse/checkpoints/
 examples/**/.synapse/branches/
+examples/**/.synapse/webhooks/
 sdk/typescript/node_modules/
 sdk/typescript/dist/
 *.o

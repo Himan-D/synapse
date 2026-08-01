@@ -57,6 +57,8 @@ pub const PipeNode = struct {
     budget_tokens: usize = 4000,
     target_datasource: ?[]const u8 = null,
     sink_path: ?[]const u8 = null,
+    sink_url: ?[]const u8 = null,
+    sum_field: ?[]const u8 = null,
 };
 
 pub const Pipe = struct {
@@ -69,12 +71,14 @@ pub const Pipe = struct {
     endpoint_params: std.ArrayList([]const u8) = .empty,
     target_datasource: ?[]const u8 = null,
     sink_path: ?[]const u8 = null,
+    sink_url: ?[]const u8 = null,
 
     pub fn deinit(self: *Pipe) void {
         self.allocator.free(self.name);
         if (self.description) |d| self.allocator.free(d);
         if (self.target_datasource) |t| self.allocator.free(t);
         if (self.sink_path) |p| self.allocator.free(p);
+        if (self.sink_url) |u| self.allocator.free(u);
         for (self.nodes.items) |*n| {
             if (n.datasource) |ds| self.allocator.free(ds);
             var wit = n.where.iterator();
@@ -88,6 +92,8 @@ pub const Pipe = struct {
             if (n.success_field) |sf| self.allocator.free(sf);
             if (n.target_datasource) |t| self.allocator.free(t);
             if (n.sink_path) |p| self.allocator.free(p);
+            if (n.sink_url) |u| self.allocator.free(u);
+            if (n.sum_field) |sf| self.allocator.free(sf);
         }
         self.nodes.deinit(self.allocator);
         if (self.endpoint_path) |p| self.allocator.free(p);
@@ -130,6 +136,7 @@ pub fn parsePipe(allocator: Allocator, bytes: []const u8) !Pipe {
     if (obj.get("target_datasource")) |t| pipe.target_datasource = try allocator.dupe(u8, t.string);
     if (obj.get("datasource")) |t| pipe.target_datasource = try allocator.dupe(u8, t.string); // Tinybird MATERIALIZED alias
     if (obj.get("sink_path")) |p| pipe.sink_path = try allocator.dupe(u8, p.string);
+    if (obj.get("sink_url")) |u| pipe.sink_url = try allocator.dupe(u8, u.string);
 
     if (obj.get("endpoint")) |ep_v| {
         const ep = ep_v.object;
@@ -173,9 +180,11 @@ pub fn parsePipe(allocator: Allocator, bytes: []const u8) !Pipe {
             }
         }
         if (nobj.get("success_field")) |sf| node.success_field = try allocator.dupe(u8, sf.string);
+        if (nobj.get("sum_field")) |sf| node.sum_field = try allocator.dupe(u8, sf.string);
         if (nobj.get("budget_tokens")) |bt| node.budget_tokens = @intCast(bt.integer);
         if (nobj.get("target_datasource")) |t| node.target_datasource = try allocator.dupe(u8, t.string);
         if (nobj.get("sink_path")) |p| node.sink_path = try allocator.dupe(u8, p.string);
+        if (nobj.get("sink_url")) |u| node.sink_url = try allocator.dupe(u8, u.string);
 
         try pipe.nodes.append(allocator, node);
     }
@@ -262,14 +271,18 @@ pub fn execute(
                     .plan => {
                         const goal = params.get("goal") orelse params.get("query") orelse "investigate";
                         const gptr: ?*const graph_mod.Graph = if (graph) |*g| g else null;
-                        const json = try plan_mod.planGoal(allocator, goal, gptr);
+                        var catalog = try plan_mod.loadToolsFile(allocator, store.io, store.root_dir);
+                        defer catalog.deinit();
+                        const json = try plan_mod.planGoal(allocator, goal, gptr, catalog.tools);
                         if (last_json) |j| allocator.free(j);
                         last_json = json;
                     },
                     .route => {
                         const query = params.get("query") orelse params.get("goal") orelse "";
                         const gptr: ?*const graph_mod.Graph = if (graph) |*g| g else null;
-                        const json = try route_mod.routeQuery(allocator, query, gptr);
+                        var catalog = try plan_mod.loadToolsFile(allocator, store.io, store.root_dir);
+                        defer catalog.deinit();
+                        const json = try route_mod.routeQuery(allocator, query, gptr, catalog.tools);
                         if (last_json) |j| allocator.free(j);
                         last_json = json;
                     },
@@ -329,7 +342,6 @@ pub fn execute(
                 last_json = try std.fmt.allocPrint(allocator, "{{\"copied\":{d},\"target\":{f}}}", .{ n, std.json.fmt(target, .{}) });
             },
             .sink => {
-                const path = node.sink_path orelse pipe.sink_path orelse return error.MissingSinkPath;
                 var tmp_body: ?[]u8 = null;
                 defer if (tmp_body) |b| allocator.free(b);
                 const body: []const u8 = if (last_json) |j| j else blk: {
@@ -337,16 +349,32 @@ pub fn execute(
                     tmp_body = try eventsToJson(allocator, evs);
                     break :blk tmp_body.?;
                 };
-                if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
-                    try std.Io.Dir.cwd().createDirPath(store.io, path[0..slash]);
+                const path = node.sink_path orelse pipe.sink_path;
+                const url = node.sink_url orelse pipe.sink_url;
+                if (path == null and url == null) return error.MissingSinkPath;
+                if (path) |p| {
+                    if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash| {
+                        try std.Io.Dir.cwd().createDirPath(store.io, p[0..slash]);
+                    }
+                    try std.Io.Dir.cwd().writeFile(store.io, .{ .sub_path = p, .data = body });
                 }
-                try std.Io.Dir.cwd().writeFile(store.io, .{ .sub_path = path, .data = body });
+                if (url) |u| {
+                    try enqueueWebhook(allocator, store.io, store.root_dir, u, body);
+                }
                 const nbytes = body.len;
                 if (last_json) |j| {
                     allocator.free(j);
                     last_json = null;
                 }
-                last_json = try std.fmt.allocPrint(allocator, "{{\"sunk\":true,\"path\":{f},\"bytes\":{d}}}", .{ std.json.fmt(path, .{}), nbytes });
+                last_json = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"sunk\":true,\"path\":{f},\"url\":{f},\"bytes\":{d}}}",
+                    .{
+                        std.json.fmt(path orelse "", .{}),
+                        std.json.fmt(url orelse "", .{}),
+                        nbytes,
+                    },
+                );
             },
         }
     }
@@ -356,9 +384,21 @@ pub fn execute(
     return .{ .allocator = allocator, .json = out };
 }
 
+fn groupKey(allocator: Allocator, ev: event_mod.Event, key_field: []const u8) ![]u8 {
+    if (std.mem.eql(u8, key_field, "type")) return try allocator.dupe(u8, ev.type_raw);
+    if (std.mem.eql(u8, key_field, "run_id")) return try allocator.dupe(u8, ev.run_id);
+    if (std.mem.eql(u8, key_field, "agent_id")) return try allocator.dupe(u8, ev.agent_id);
+    if (std.mem.eql(u8, key_field, "name") or std.mem.eql(u8, key_field, "model")) {
+        const name = (try event_mod.payloadString(allocator, ev.payload_json, key_field)) orelse
+            try allocator.dupe(u8, "unknown");
+        return name;
+    }
+    return try allocator.dupe(u8, "all");
+}
+
 fn runAggregate(allocator: Allocator, events: []const event_mod.Event, node: PipeNode) ![]u8 {
     const key_field = node.group_by orelse "type";
-    var groups: std.StringArrayHashMapUnmanaged(struct { total: usize, success: usize }) = .empty;
+    var groups: std.StringArrayHashMapUnmanaged(struct { total: usize, success: usize, sum: f64 }) = .empty;
     defer {
         var it = groups.iterator();
         while (it.next()) |e| allocator.free(e.key_ptr.*);
@@ -366,20 +406,10 @@ fn runAggregate(allocator: Allocator, events: []const event_mod.Event, node: Pip
     }
 
     for (events) |ev| {
-        const key_owned = blk: {
-            if (std.mem.eql(u8, key_field, "type")) break :blk try allocator.dupe(u8, ev.type_raw);
-            if (std.mem.eql(u8, key_field, "run_id")) break :blk try allocator.dupe(u8, ev.run_id);
-            if (std.mem.eql(u8, key_field, "agent_id")) break :blk try allocator.dupe(u8, ev.agent_id);
-            if (std.mem.eql(u8, key_field, "name")) {
-                const name = (try event_mod.payloadString(allocator, ev.payload_json, "name")) orelse
-                    try allocator.dupe(u8, "unknown");
-                break :blk name;
-            }
-            break :blk try allocator.dupe(u8, "all");
-        };
+        const key_owned = try groupKey(allocator, ev, key_field);
         const gop = try groups.getOrPut(allocator, key_owned);
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .total = 0, .success = 0 };
+            gop.value_ptr.* = .{ .total = 0, .success = 0, .sum = 0 };
         } else {
             allocator.free(key_owned);
         }
@@ -388,11 +418,16 @@ fn runAggregate(allocator: Allocator, events: []const event_mod.Event, node: Pip
         if (event_mod.payloadBool(allocator, ev.payload_json, success_field)) {
             gop.value_ptr.success += 1;
         }
+        if (node.sum_field) |sf| {
+            if (event_mod.payloadNumber(allocator, ev.payload_json, sf)) |n| {
+                gop.value_ptr.sum += n;
+            }
+        }
     }
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    try aw.writer.writeAll("{\"groups\":[");
+    try aw.writer.print("{{\"op\":\"{s}\",\"groups\":[", .{@tagName(node.aggregate_op)});
     var first = true;
     var it = groups.iterator();
     while (it.next()) |e| {
@@ -401,15 +436,46 @@ fn runAggregate(allocator: Allocator, events: []const event_mod.Event, node: Pip
         const total = e.value_ptr.total;
         const success = e.value_ptr.success;
         const fail = total - success;
-        const rate: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(fail)) / @as(f64, @floatFromInt(total));
-        try aw.writer.print(
-            \\{{"key":{f},"total":{d},"success":{d},"failure":{d},"failure_rate":{d:.4}}}
-        ,
-            .{ std.json.fmt(e.key_ptr.*, .{}), total, success, fail, rate },
-        );
+        switch (node.aggregate_op) {
+            .count => try aw.writer.print(
+                \\{{"key":{f},"count":{d}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), total },
+            ),
+            .sum => try aw.writer.print(
+                \\{{"key":{f},"count":{d},"sum":{d:.4}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), total, e.value_ptr.sum },
+            ),
+            .rate => {
+                const rate: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(fail)) / @as(f64, @floatFromInt(total));
+                try aw.writer.print(
+                    \\{{"key":{f},"total":{d},"success":{d},"failure":{d},"failure_rate":{d:.4}}}
+                ,
+                    .{ std.json.fmt(e.key_ptr.*, .{}), total, success, fail, rate },
+                );
+            },
+        }
     }
     try aw.writer.writeAll("]}");
     return try aw.toOwnedSlice();
+}
+
+fn enqueueWebhook(allocator: Allocator, io: std.Io, root: []const u8, url: []const u8, body: []const u8) !void {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/webhooks", .{root});
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const outbox = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/webhooks/outbox.ndjson", .{root});
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    // Append mode: read existing + append line
+    if (std.Io.Dir.cwd().readFileAlloc(io, outbox, allocator, .unlimited)) |prev| {
+        defer allocator.free(prev);
+        try aw.writer.writeAll(prev);
+    } else |_| {}
+    try aw.writer.print("{{\"url\":{f},\"body\":{f}}}\n", .{ std.json.fmt(url, .{}), std.json.fmt(body, .{}) });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outbox, .data = aw.written() });
 }
 
 fn runBlastRadius(allocator: Allocator, graph: *const graph_mod.Graph, node_id: ?[]const u8) ![]u8 {

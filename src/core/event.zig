@@ -139,6 +139,22 @@ pub fn payloadBool(allocator: Allocator, payload_json: []const u8, key: []const 
     };
 }
 
+/// Extract a numeric payload field as f64 (string numbers unsupported).
+pub fn payloadNumber(allocator: Allocator, payload_json: []const u8, key: []const u8) ?f64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
 test "parseEvent happy path" {
     const line =
         \\{"ts":"2026-07-31T14:00:00Z","run_id":"run_1","agent_id":"a1","type":"tool_call","payload":{"name":"grep","ok":true}}
