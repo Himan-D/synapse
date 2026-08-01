@@ -2,7 +2,11 @@
 zig-cache/
 zig-out/
 .synapse/data/
+.synapse/exports/
+.synapse/tokens.json
 examples/**/.synapse/data/
+examples/**/.synapse/exports/
+examples/**/.synapse/tokens.json
 *.o
 *.obj
 .DS_Store
