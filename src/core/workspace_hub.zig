@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const workspace_mod = @import("workspace.zig");
 const platform_mod = @import("platform.zig");
+const usage_mod = @import("usage.zig");
 const auth_mod = @import("auth.zig");
 
 /// Result of an authorization check.
@@ -21,16 +22,20 @@ pub const WorkspaceHub = struct {
     io: Io,
     data_root: []const u8,
     platform: platform_mod.PlatformStore,
+    usage: usage_mod.UsageStore,
     /// Lazily loaded workspaces, keyed by workspace id.
     loaded: std.StringHashMapUnmanaged(*workspace_mod.Workspace) = .empty,
 
     pub fn init(allocator: Allocator, io: Io, data_root: []const u8) !WorkspaceHub {
-        const platform = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        var platform = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        errdefer platform.deinit();
+        const usage = try usage_mod.UsageStore.init(allocator, io, data_root);
         return .{
             .allocator = allocator,
             .io = io,
             .data_root = try allocator.dupe(u8, data_root),
             .platform = platform,
+            .usage = usage,
         };
     }
 
@@ -43,6 +48,7 @@ pub const WorkspaceHub = struct {
         var kit = self.loaded.keyIterator();
         while (kit.next()) |k| self.allocator.free(k.*);
         self.loaded.deinit(self.allocator);
+        self.usage.deinit();
         self.platform.deinit();
         self.allocator.free(self.data_root);
         self.* = undefined;
@@ -159,6 +165,11 @@ test "hub get unknown workspace" {
             .io = undefined,
             .data_root = try gpa.dupe(u8, tmp_dir),
         },
+        .usage = .{
+            .allocator = gpa,
+            .io = undefined,
+            .data_root = try gpa.dupe(u8, tmp_dir),
+        },
     };
     defer hub.deinit();
 
@@ -177,15 +188,23 @@ test "authorizeForWorkspace: 401 vs 403 distinction" {
             .io = undefined,
             .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
         },
+        .usage = .{
+            .allocator = gpa,
+            .io = undefined,
+            .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
+        },
     };
     defer hub.deinit();
 
-    hub.platform.admin_token = try gpa.dupe(u8, "sk.admintoken");
+    const admin_hash = platform_mod.hashTokenHex("sk.admintoken");
+    hub.platform.admin_token_hash = try gpa.dupe(u8, &admin_hash);
 
     const scopes = try gpa.dupe(auth_mod.Scope, &[_]auth_mod.Scope{.admin});
+    const token_hash = platform_mod.hashTokenHex("p.tokenA");
     try hub.platform.tokens.append(gpa, .{
+        .id = try gpa.dupe(u8, "tok_a"),
         .name = try gpa.dupe(u8, "tok_a"),
-        .token = try gpa.dupe(u8, "p.tokenA"),
+        .token_hash = try gpa.dupe(u8, &token_hash),
         .org_id = try gpa.dupe(u8, "org_1"),
         .workspace_id = try gpa.dupe(u8, "ws_alpha"),
         .scopes = scopes,

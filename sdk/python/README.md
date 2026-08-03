@@ -15,6 +15,14 @@ s.dispute("run_demo")
 s.remember("run_demo", "margin risk is elevated", confidence=0.9)
 ```
 
+Against hosted Synapse, pass the workspace id and its token. Every verb is then
+routed to `/v1/w/{workspace_id}/…`:
+
+```python
+s = Synapse("https://synapse.example.com", token="p.…", workspace_id="ws_…")
+s.recall("run_demo", query="risk")   # GET /v1/w/ws_…/recall
+```
+
 Install:
 
 ```bash

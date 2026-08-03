@@ -10,6 +10,14 @@ const version_mod = @import("../core/version.zig");
 const safe_name = @import("../core/safe_name.zig");
 const ratelimit_mod = @import("../core/ratelimit.zig");
 const auth_mod = @import("../core/auth.zig");
+const usage_mod = @import("../core/usage.zig");
+
+/// Where to attribute per-workspace usage for the request being served.
+/// Absent in single-workspace dev mode, which is not metered.
+const UsageRecorder = struct {
+    store: *usage_mod.UsageStore,
+    workspace_id: []const u8,
+};
 
 pub const max_body_bytes: usize = 16 * 1024 * 1024;
 
@@ -390,7 +398,7 @@ fn handleConn(
         return;
     }
 
-    try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body);
+    try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body, null);
 }
 
 // ── Multi-workspace connection handler ────────────────────────────────────────
@@ -458,6 +466,18 @@ fn handleConnCloud(
         }
     }
 
+    // Cloud admin console. Public like the workspace playground: it ships no
+    // secrets and asks the operator to paste an admin token at runtime.
+    if (method == .GET and (std.mem.eql(u8, path, "/cloud") or
+        std.mem.eql(u8, path, "/cloud/") or
+        std.mem.eql(u8, path, "/ui/cloud")))
+    {
+        const html = try loadCloudHtml(allocator, io);
+        defer allocator.free(html);
+        try respond(&request, &meta, html, .ok, "text/html; charset=utf-8");
+        return;
+    }
+
     // Platform control plane: /v1/platform/*
     if (std.mem.startsWith(u8, path, "/v1/platform")) {
         if (envTruthy("SYNAPSE_REQUIRE_AUTH")) {
@@ -473,7 +493,7 @@ fn handleConnCloud(
                 },
             }
         }
-        try platformControlPlane(allocator, hub, &request, &meta, path, max_body);
+        try platformControlPlane(allocator, hub, &request, &meta, path, target, max_body);
         return;
     }
 
@@ -530,7 +550,9 @@ fn handleConnCloud(
             }
         }
 
-        try routeWorkspace(allocator, io, ws, &request, &meta, rewritten_path, rewritten_target, max_body);
+        hub.usage.recordRequest(workspace_id);
+        const recorder: UsageRecorder = .{ .store = &hub.usage, .workspace_id = workspace_id };
+        try routeWorkspace(allocator, io, ws, &request, &meta, rewritten_path, rewritten_target, max_body, recorder);
         return;
     }
 
@@ -571,7 +593,9 @@ fn handleConnCloud(
                 },
             }
         }
-        try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body);
+        hub.usage.recordRequest(def_ws);
+        const recorder: UsageRecorder = .{ .store = &hub.usage, .workspace_id = def_ws };
+        try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body, recorder);
         return;
     }
 
@@ -589,8 +613,17 @@ fn platformControlPlane(
     request: *std.http.Server.Request,
     meta: *RequestMeta,
     path: []const u8,
+    target: []const u8,
     max_body: usize,
 ) !void {
+    // GET /v1/platform/usage — per-workspace counters for billing.
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/usage")) {
+        const json = try hub.usage.toJson(allocator);
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
     // GET /v1/platform/orgs
     if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/orgs")) {
         const json = try hub.platform.listOrgsJson(allocator);
@@ -668,6 +701,24 @@ fn platformControlPlane(
         };
         try respond(request, meta, json, .ok, "application/json");
         return;
+    }
+
+    // GET /v1/platform/tokens[?workspace_id=…] — metadata only, never secrets.
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/tokens")) {
+        const ws_filter = queryParam(target, "workspace_id") orelse "";
+        const json = try hub.platform.listTokensJson(allocator, ws_filter);
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    // POST /v1/platform/tokens/{token_id}/revoke
+    if (request.head.method == .POST and
+        std.mem.startsWith(u8, path, "/v1/platform/tokens/") and
+        std.mem.endsWith(u8, path, "/revoke"))
+    {
+        const token_id = path["/v1/platform/tokens/".len .. path.len - "/revoke".len];
+        return revokeTokenRoute(allocator, hub, request, meta, token_id);
     }
 
     // POST /v1/platform/tokens  — body: {"workspace_id": "...", "name": "...", "scope": "..."}
@@ -761,9 +812,48 @@ fn platformControlPlane(
                 }
             }
 
-            // POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
             const ws_prefix = "/workspaces/";
             const tok_suffix = "/tokens";
+
+            // GET  /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
+            // POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens/{token_id}/revoke
+            if (std.mem.startsWith(u8, rest, ws_prefix)) {
+                const after_ws = rest[ws_prefix.len..];
+                if (std.mem.indexOfScalar(u8, after_ws, '/')) |ws_slash| {
+                    const workspace_id = after_ws[0..ws_slash];
+                    const ws_rest = after_ws[ws_slash..];
+
+                    if (request.head.method == .GET and std.mem.eql(u8, ws_rest, tok_suffix)) {
+                        if (!hub.platform.orgOwnsWorkspace(org_id, workspace_id)) {
+                            try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
+                            return;
+                        }
+                        const json = try hub.platform.listTokensJson(allocator, workspace_id);
+                        defer allocator.free(json);
+                        try respond(request, meta, json, .ok, "application/json");
+                        return;
+                    }
+
+                    if (request.head.method == .POST and
+                        std.mem.startsWith(u8, ws_rest, tok_suffix ++ "/") and
+                        std.mem.endsWith(u8, ws_rest, "/revoke"))
+                    {
+                        const token_id = ws_rest[(tok_suffix ++ "/").len .. ws_rest.len - "/revoke".len];
+                        if (!hub.platform.orgOwnsWorkspace(org_id, workspace_id)) {
+                            try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
+                            return;
+                        }
+                        const tok = hub.platform.findTokenById(token_id);
+                        if (tok == null or !std.mem.eql(u8, tok.?.workspace_id, workspace_id)) {
+                            try respond(request, meta, "{\"error\":\"token_not_found\"}\n", .not_found, "application/json");
+                            return;
+                        }
+                        return revokeTokenRoute(allocator, hub, request, meta, token_id);
+                    }
+                }
+            }
+
+            // POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
             if (request.head.method == .POST and
                 std.mem.startsWith(u8, rest, ws_prefix) and
                 std.mem.endsWith(u8, rest, tok_suffix) and
@@ -812,6 +902,28 @@ fn platformControlPlane(
     try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
 }
 
+fn revokeTokenRoute(
+    allocator: Allocator,
+    hub: *hub_mod.WorkspaceHub,
+    request: *std.http.Server.Request,
+    meta: *RequestMeta,
+    token_id: []const u8,
+) !void {
+    if (token_id.len == 0 or std.mem.indexOfScalar(u8, token_id, '/') != null) {
+        try respond(request, meta, "{\"error\":\"invalid_token_id\"}\n", .bad_request, "application/json");
+        return;
+    }
+    const json = hub.platform.revokeToken(token_id) catch |err| switch (err) {
+        error.TokenNotFound => {
+            try respond(request, meta, "{\"error\":\"token_not_found\"}\n", .not_found, "application/json");
+            return;
+        },
+        else => |e| return e,
+    };
+    defer allocator.free(json);
+    try respond(request, meta, json, .ok, "application/json");
+}
+
 // ── Workspace request dispatcher (shared by single and multi mode) ────────────
 
 fn routeWorkspace(
@@ -823,6 +935,7 @@ fn routeWorkspace(
     path: []const u8,
     target: []const u8,
     max_body: usize,
+    usage: ?UsageRecorder,
 ) !void {
     const method = request.head.method;
 
@@ -870,6 +983,7 @@ fn routeWorkspace(
         };
         ws.runMaterializedPipes() catch {};
         ws.logOp("ingest", ds, "ok");
+        if (usage) |u| u.store.recordIngest(u.workspace_id, @intCast(n), body.len);
         var resp_buf: [64]u8 = undefined;
         const resp = try std.fmt.bufPrint(&resp_buf, "{{\"ingested\":{d}}}\n", .{n});
         try respond(request, meta, resp, .ok, "application/json");
@@ -1250,6 +1364,20 @@ fn pathOnlyStr(target: []const u8) []const u8 {
     return target;
 }
 
+/// Raw (not percent-decoded) query parameter lookup, for opaque id values.
+fn queryParam(target: []const u8, key: []const u8) ?[]const u8 {
+    const qmark = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[qmark + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+        const v = pair[eq + 1 ..];
+        if (v.len == 0) return null;
+        return v;
+    }
+    return null;
+}
+
 fn runDatasourceQuery(
     allocator: Allocator,
     request: *std.http.Server.Request,
@@ -1389,5 +1517,18 @@ fn loadUiHtml(allocator: Allocator, io: Io) ![]u8 {
         \\<!doctype html><html><body style="font-family:system-ui;padding:2rem">
         \\<h1>Synapse</h1><p>Place <code>web/index.html</code> next to the binary cwd for the playground.</p>
         \\<p><a href="/v1/workspace">/v1/workspace</a></p></body></html>
+    );
+}
+
+fn loadCloudHtml(allocator: Allocator, io: Io) ![]u8 {
+    const candidates = [_][]const u8{ "web/cloud.html", "ui/cloud.html" };
+    for (candidates) |p| {
+        if (Io.Dir.cwd().readFileAlloc(io, p, allocator, .unlimited)) |bytes| return bytes else |_| {}
+    }
+    return try allocator.dupe(u8,
+        \\<!doctype html><html><body style="font-family:system-ui;padding:2rem">
+        \\<h1>Synapse Cloud</h1><p>Place <code>web/cloud.html</code> next to the binary cwd for the admin console.</p>
+        \\<p>Control plane is still reachable directly: <code>GET /v1/platform/orgs</code> with an admin bearer token.</p>
+        \\</body></html>
     );
 }

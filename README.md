@@ -11,7 +11,7 @@ See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md)
 | Mode | Command | Status |
 |---|---|---|
 | **Local single-root** — one workspace per process | `synapse dev --root <dir>` | **Stable.** The recommended path. Start with `./scripts/demo.sh`. |
-| **Cloud multi-tenant** — many workspaces, orgs, scoped tokens | `synapse cloud serve` | **Phase C beta.** The HTTP contract is stable and workspace isolation is covered by `scripts/e2e_cloud.sh` in CI, but it has far less production mileage, and token revocation/expiry are not implemented. See [docs/CLOUD.md](docs/CLOUD.md). |
+| **Cloud multi-tenant** — many workspaces, orgs, scoped tokens | `synapse cloud serve` | **Phase C beta.** The HTTP contract is stable and workspace isolation is covered by `scripts/e2e_cloud.sh` in CI, but it has far less production mileage, and tokens have no expiry or rotation (revoke and re-mint instead). See [docs/CLOUD.md](docs/CLOUD.md) and [docs/CLOUD_COMPANY.md](docs/CLOUD_COMPANY.md). |
 
 Both modes read byte-identical workspace directories, so nothing you build
 locally has to be rewritten to move to cloud mode.
@@ -176,9 +176,19 @@ See **[docs/CLOUD.md](docs/CLOUD.md)** for:
 - Environment variables reference
 - Security model (401 vs 403, scope matrix)
 
-Known beta gaps: no token revocation, rotation, or expiry (edit `platform.json`
-and restart); tokens carry exactly one scope; the Python and TypeScript SDKs do
-not build workspace-prefixed URLs for you.
+- **Cloud company spine** — tokens hashed at rest with revoke/list, per-workspace
+  usage metering (`GET /v1/platform/usage`), `scripts/cloud_bootstrap.sh` for a
+  one-shot tenant, and a `/cloud` admin console. What is shipped versus
+  deliberately deferred is tracked in
+  **[docs/CLOUD_COMPANY.md](docs/CLOUD_COMPANY.md)**.
+
+```bash
+./scripts/cloud_bootstrap.sh /tmp/synapse-data   # prints admin + workspace tokens once
+```
+
+Known beta gaps: tokens have no rotation or expiry (revoke and re-mint instead);
+tokens carry exactly one scope; there is no billing integration — metering exports
+raw counters and stops there.
 
 ## Develop
 

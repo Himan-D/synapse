@@ -9,11 +9,28 @@ from typing import Any, Iterable, Mapping, Optional
 
 
 class Synapse:
-    """HTTP client for a local or remote Synapse runtime."""
+    """HTTP client for a local or remote Synapse runtime.
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8787", token: Optional[str] = None):
+    Pass ``workspace_id`` to talk to a hosted (cloud) tenant: every verb is then
+    sent to ``/v1/w/{workspace_id}/…`` instead of the single-workspace ``/v1/…``
+    routes. ``/health`` is workspace-independent and is never prefixed.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8787",
+        token: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self.workspace_id = workspace_id
+
+    def _path(self, path: str) -> str:
+        """Prefix a /v1 verb with the workspace route when one is configured."""
+        if self.workspace_id and path.startswith("/v1/"):
+            return f"/v1/w/{self.workspace_id}{path[len('/v1'):]}"
+        return path
 
     def _headers(self, content_type: Optional[str] = None) -> dict[str, str]:
         h: dict[str, str] = {}
@@ -32,7 +49,7 @@ class Synapse:
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
     ) -> Any:
-        url = f"{self.base_url}{path}"
+        url = f"{self.base_url}{self._path(path)}"
         if query:
             url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
         req = urllib.request.Request(url, data=body, method=method, headers=self._headers(content_type))

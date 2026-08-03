@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Synapse Cloud — Admin</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a222c;
+      --ink: #e7ecf1;
+      --muted: #8b9aab;
+      --accent: #3d9cf0;
+      --line: #2a3542;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1c2a3a, var(--bg));
+      color: var(--ink);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+    }
+    header h1 {
+      margin: 0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 1.25rem;
+      letter-spacing: 0.04em;
+    }
+    header span { color: var(--muted); font-size: 0.9rem; }
+    main {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 0;
+      min-height: calc(100vh - 64px);
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      padding: 1rem;
+      background: color-mix(in srgb, var(--panel) 85%, transparent);
+    }
+    aside h2 {
+      font-size: 0.75rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 1.25rem 0 0.5rem;
+    }
+    aside h2:first-of-type { margin-top: 0; }
+    button, input {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0.55rem 0.75rem;
+    }
+    aside button {
+      width: 100%;
+      text-align: left;
+      margin: 0.25rem 0;
+      cursor: pointer;
+    }
+    aside input { width: 100%; margin: 0.25rem 0; }
+    button:hover { border-color: var(--accent); }
+    section { padding: 1.25rem 1.5rem; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .row input { flex: 1; min-width: 160px; }
+    .row button { cursor: pointer; }
+    .note {
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.5;
+      margin: 0 0 0.75rem;
+    }
+    .note code {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      color: var(--ink);
+    }
+    pre {
+      margin: 0;
+      padding: 1rem;
+      background: #0b1015;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: auto;
+      max-height: calc(100vh - 260px);
+      font-size: 0.85rem;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SYNAPSE CLOUD</h1>
+    <span>Admin console · orgs, workspaces, tokens, usage</span>
+  </header>
+  <main>
+    <aside>
+      <h2>Connection</h2>
+      <input id="base" placeholder="http://127.0.0.1:8787" />
+      <input id="admin" type="password" placeholder="admin token (sk.…)" />
+      <p class="note">
+        Kept in this tab only — never stored, never sent anywhere but the API base above.
+      </p>
+
+      <h2>Read</h2>
+      <button data-get="/v1/platform/orgs">List orgs</button>
+      <button data-get="/v1/platform/workspaces">List workspaces</button>
+      <button data-get="/v1/platform/usage">Usage counters</button>
+      <button id="list-tokens">List tokens for workspace…</button>
+
+      <h2>Write</h2>
+      <input id="org-name" placeholder="new org name" />
+      <button id="create-org">Create org</button>
+      <input id="ws-org" placeholder="org_… (owner)" />
+      <input id="ws-name" placeholder="new workspace name" />
+      <button id="create-ws">Create workspace</button>
+      <input id="tok-ws" placeholder="ws_… (workspace)" />
+      <input id="tok-name" placeholder="token name" />
+      <input id="tok-scope" placeholder="scope (default ADMIN)" />
+      <button id="mint-token">Mint token</button>
+      <input id="revoke-id" placeholder="tok_… (token id)" />
+      <button id="revoke-token">Revoke token</button>
+    </aside>
+    <section>
+      <p class="note">
+        Every call below is a plain HTTP request against <code>/v1/platform/*</code> with your admin
+        bearer token; nothing is computed in the browser. A minted token's secret is shown once in
+        the response and is not recoverable afterwards — only its SHA-256 digest reaches disk.
+        Usage counters are raw request/ingest totals, not an invoice.
+      </p>
+      <div class="row">
+        <input id="custom" placeholder="/v1/platform/tokens?workspace_id=ws_…" />
+        <button id="go">GET</button>
+      </div>
+      <pre id="out">Set an API base and admin token, then pick an action.</pre>
+    </section>
+  </main>
+  <script>
+    const out = document.getElementById("out");
+    const $ = (id) => document.getElementById(id);
+
+    $("base").value = location.origin;
+
+    function baseUrl() {
+      return ($("base").value || location.origin).replace(/\/$/, "");
+    }
+
+    function headers(contentType) {
+      const h = {};
+      const token = $("admin").value.trim();
+      if (token) h.Authorization = "Bearer " + token;
+      if (contentType) h["Content-Type"] = contentType;
+      return h;
+    }
+
+    async function call(method, path, body) {
+      out.textContent = method + " " + path + " …";
+      try {
+        const res = await fetch(baseUrl() + path, {
+          method,
+          headers: headers(body ? "application/json" : undefined),
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const text = await res.text();
+        let rendered = text;
+        try {
+          rendered = JSON.stringify(JSON.parse(text), null, 2);
+        } catch {}
+        out.textContent = method + " " + path + " → " + res.status + "\n\n" + rendered;
+      } catch (e) {
+        out.textContent = method + " " + path + " → " + String(e);
+      }
+    }
+
+    function required(id, label) {
+      const v = $(id).value.trim();
+      if (!v) out.textContent = "Missing: " + label;
+      return v;
+    }
+
+    document.querySelectorAll("aside button[data-get]").forEach((b) => {
+      b.addEventListener("click", () => call("GET", b.dataset.get));
+    });
+
+    $("go").addEventListener("click", () => {
+      const v = $("custom").value.trim();
+      if (v) call("GET", v.startsWith("/") ? v : "/" + v);
+    });
+
+    $("list-tokens").addEventListener("click", () => {
+      const ws = $("tok-ws").value.trim();
+      call("GET", ws ? "/v1/platform/tokens?workspace_id=" + encodeURIComponent(ws) : "/v1/platform/tokens");
+    });
+
+    $("create-org").addEventListener("click", () => {
+      const name = required("org-name", "org name");
+      if (name) call("POST", "/v1/platform/orgs", { name });
+    });
+
+    $("create-ws").addEventListener("click", () => {
+      const org = required("ws-org", "owning org id");
+      if (!org) return;
+      const name = required("ws-name", "workspace name");
+      if (name) call("POST", "/v1/platform/orgs/" + encodeURIComponent(org) + "/workspaces", { name });
+    });
+
+    $("mint-token").addEventListener("click", () => {
+      const ws = required("tok-ws", "workspace id");
+      if (!ws) return;
+      call("POST", "/v1/platform/tokens", {
+        workspace_id: ws,
+        name: $("tok-name").value.trim() || "api",
+        scope: $("tok-scope").value.trim() || "ADMIN",
+      });
+    });
+
+    $("revoke-token").addEventListener("click", () => {
+      const id = required("revoke-id", "token id");
+      if (id) call("POST", "/v1/platform/tokens/" + encodeURIComponent(id) + "/revoke");
+    });
+  </script>
+</body>
+</html>

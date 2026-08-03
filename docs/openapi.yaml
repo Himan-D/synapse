@@ -21,6 +21,16 @@ info:
     ### Valid token scopes
     `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ`.
     `MIND:READ` and `MIND:WRITE` are **not** valid — the server rejects them with `400 unknown_scope`.
+
+    ### Token lifecycle
+    Only a SHA-256 digest of each token is persisted. The raw secret appears once,
+    in the mint response; listings return metadata only. Revoke by token id with
+    `POST /v1/platform/tokens/{token_id}/revoke` — the token is refused immediately
+    and the revocation survives a restart.
+
+    ### Metering
+    `GET /v1/platform/usage` exports per-workspace request and ingest counters.
+    They are raw counters, not an invoice: Synapse has no billing integration.
   version: 0.1.0
 servers:
   - url: http://127.0.0.1:8787
@@ -564,6 +574,136 @@ paths:
                   scopes: { type: array, items: { type: string } }
         "401": { description: Admin token required }
         "404": { description: Unknown workspace }
+    get:
+      summary: List token metadata for a workspace
+      description: Metadata only. Secrets are unrecoverable after minting.
+      tags: [control-plane]
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Token metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TokenMetadata'
+        "401": { description: Admin token required }
+        "404": { description: Unknown org or workspace }
+
+  /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens/{token_id}/revoke:
+    post:
+      summary: Revoke a workspace token
+      description: Idempotent. A revoked token is refused by every workspace route.
+      tags: [control-plane]
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+        - { name: token_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenRevoked' }
+        "401": { description: Admin token required }
+        "404": { description: Unknown org, workspace, or token }
+
+  /v1/platform/tokens:
+    get:
+      summary: List token metadata (flat alias)
+      description: Metadata only. Secrets are unrecoverable after minting.
+      tags: [control-plane]
+      parameters:
+        - name: workspace_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Restrict the listing to one workspace. Omit to list all.
+      responses:
+        "200":
+          description: Token metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TokenMetadata'
+        "401": { description: Admin token required }
+    post:
+      summary: Mint scoped token (flat alias)
+      tags: [control-plane]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workspace_id]
+              properties:
+                workspace_id: { type: string }
+                name: { type: string, default: api }
+                scope:
+                  type: string
+                  enum: [ADMIN, PIPES:READ, EVENTS:WRITE, REMEMBER:WRITE, QUERY:READ]
+                  default: ADMIN
+      responses:
+        "200":
+          description: Minted token. `token` is returned once and never again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenMinted' }
+        "400": { description: Unknown workspace or scope }
+        "401": { description: Admin token required }
+
+  /v1/platform/tokens/{token_id}/revoke:
+    post:
+      summary: Revoke a token by id (flat alias)
+      tags: [control-plane]
+      parameters:
+        - { name: token_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenRevoked' }
+        "401": { description: Admin token required }
+        "404": { description: Unknown token }
+
+  /v1/platform/usage:
+    get:
+      summary: Per-workspace usage counters
+      description: |
+        Raw counters for billing to consume later. Synapse does not price, invoice,
+        or charge anything; a billing job is expected to diff two snapshots.
+      tags: [control-plane]
+      responses:
+        "200":
+          description: Usage export
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageExport' }
+        "401": { description: Admin token required }
+
+  /cloud:
+    get:
+      summary: Cloud admin console (HTML)
+      description: |
+        Static admin page, also served at `/ui/cloud`. Ships no secrets; the operator
+        pastes an admin token into the page at runtime. Cloud mode only.
+      tags: [control-plane]
+      security: []
+      responses:
+        "200": { description: HTML page }
 
 components:
   schemas:
@@ -588,6 +728,55 @@ components:
         workspace: { $ref: '#/components/schemas/Workspace' }
         admin_token: { type: string }
         data_path: { type: string }
+
+    TokenMetadata:
+      type: object
+      description: Everything the platform can still tell you about a token after minting.
+      properties:
+        id: { type: string, example: tok_9f1c2a3b4d5e6f70 }
+        name: { type: string }
+        org_id: { type: string }
+        workspace_id: { type: string }
+        created_at: { type: integer, description: Unix seconds }
+        revoked: { type: boolean }
+        scopes: { type: array, items: { type: string } }
+
+    TokenMinted:
+      type: object
+      description: |
+        The only response that contains a raw secret. Only its SHA-256 digest is
+        persisted, so a lost token must be revoked and re-minted.
+      properties:
+        created: { type: boolean }
+        id: { type: string }
+        name: { type: string }
+        token: { type: string, description: Raw secret, shown exactly once }
+        workspace_id: { type: string }
+        scopes: { type: array, items: { type: string } }
+        created_at: { type: integer, description: Unix seconds }
+
+    TokenRevoked:
+      type: object
+      properties:
+        revoked: { type: boolean }
+        id: { type: string }
+        workspace_id: { type: string }
+        already_revoked: { type: boolean }
+
+    UsageExport:
+      type: object
+      properties:
+        version: { type: integer }
+        workspaces:
+          type: array
+          items:
+            type: object
+            properties:
+              workspace_id: { type: string }
+              requests: { type: integer, description: Authenticated workspace requests served }
+              ingest_events: { type: integer, description: Events accepted by /v1/events/* }
+              ingest_bytes: { type: integer, description: Raw ingest request body bytes }
+              updated_at: { type: integer, description: Unix seconds of the last increment }
 
   securitySchemes:
     bearerAuth:

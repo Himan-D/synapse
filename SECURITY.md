@@ -51,17 +51,23 @@ as working-as-intended.
   per-workspace value, readable by the user running the server. It authorizes
   only single-root dev mode; `cloud serve` never consults it. Cloud-scaffolded
   workspaces get no local token.
-- **`platform.json` stores tokens in plaintext.** It is the credential store for
-  cloud mode and is expected to live on a private disk with normal filesystem
-  permissions. Treat it as a secret. Hashed-at-rest tokens are not implemented.
+- **`platform.json` stores only SHA-256 digests of tokens.** A leaked catalog
+  does not yield usable credentials, but it still lists your orgs, workspaces,
+  and token metadata, so keep it on a private disk with normal filesystem
+  permissions. A file written by an older build is migrated to digests on first
+  load. Digests are unsalted SHA-256, which is fine for 128-bit random tokens
+  and would not be for user-chosen passwords.
 - **`?token=` in a query string.** Supported for clients that cannot set
   headers, and it will appear in access logs and proxy logs. Prefer
   `Authorization: Bearer`.
 - **No TLS.** Synapse speaks plain HTTP by design; terminate TLS at your load
   balancer, reverse proxy, or platform (Render does this for you).
 - **No rate limiting unless configured.** Set `SYNAPSE_RATE_LIMIT=<req/s>`.
-- **No token expiry or revocation endpoint.** To revoke, remove the entry from
-  `platform.json` and restart. Tracked in `docs/PRODUCTION_PLAN.md`.
+- **No token expiry or rotation.** Revocation exists
+  (`POST /v1/platform/tokens/{token_id}/revoke`, or `synapse token revoke <id>`,
+  effective on the running server without a restart), but tokens never expire on
+  their own and there is no rotate-in-place. Revoke and re-mint. Tracked in
+  `docs/PRODUCTION_PLAN.md`.
 - **Pipe definitions are trusted input.** Anyone who can write `pipes/*.pipe.json`
   in a workspace already controls what that workspace computes and where its
   `sink` nodes POST. Treat workspace write access as equivalent to code access.

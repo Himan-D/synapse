@@ -1,11 +1,27 @@
 export type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 
+/**
+ * HTTP client for a local or remote Synapse runtime.
+ *
+ * Pass `workspaceId` to talk to a hosted (cloud) tenant: every verb is then sent
+ * to `/v1/w/{workspaceId}/…` instead of the single-workspace `/v1/…` routes.
+ * `/health` is workspace-independent and is never prefixed.
+ */
 export class Synapse {
   constructor(
     public baseUrl = "http://127.0.0.1:8787",
     public token?: string,
+    public workspaceId?: string,
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+  }
+
+  /** Prefix a /v1 verb with the workspace route when one is configured. */
+  private resolvePath(path: string): string {
+    if (this.workspaceId && path.startsWith("/v1/")) {
+      return `/v1/w/${this.workspaceId}${path.slice("/v1".length)}`;
+    }
+    return path;
   }
 
   private headers(contentType?: string): Record<string, string> {
@@ -20,7 +36,7 @@ export class Synapse {
     path: string,
     opts: { query?: Record<string, string | number | undefined>; body?: string; contentType?: string } = {},
   ): Promise<Json> {
-    const url = new URL(this.baseUrl + path);
+    const url = new URL(this.baseUrl + this.resolvePath(path));
     if (opts.query) {
       for (const [k, v] of Object.entries(opts.query)) {
         if (v !== undefined && v !== "") url.searchParams.set(k, String(v));

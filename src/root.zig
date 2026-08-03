@@ -21,6 +21,7 @@ pub const ratelimit = @import("core/ratelimit.zig");
 pub const workflow = @import("core/workflow.zig");
 pub const workspace = @import("core/workspace.zig");
 pub const platform = @import("core/platform.zig");
+pub const usage = @import("core/usage.zig");
 pub const workspace_hub = @import("core/workspace_hub.zig");
 pub const http = @import("server/http.zig");
 pub const mcp = @import("server/mcp.zig");

@@ -326,6 +326,27 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (args.len < 3) return error.Usage;
     const sub = args[2];
 
+    // Revoking is addressed by token id, so it needs no --workspace flag.
+    if (std.mem.eql(u8, sub, "revoke")) {
+        if (args.len < 4) {
+            std.debug.print("Usage: synapse token revoke <token_id> --data-root <dir>\n", .{});
+            return error.Usage;
+        }
+        const data_root = dataRootFlag(args);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = store.revokeToken(args[3]) catch |err| switch (err) {
+            error.TokenNotFound => {
+                std.log.err("token '{s}' not found in platform store", .{args[3]});
+                return error.TokenNotFound;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
     // If --workspace flag present → platform-level token.
     const ws_flag = flagOr(args, "--workspace", "");
     if (ws_flag.len > 0) {
@@ -440,23 +461,10 @@ fn runPlatformToken(allocator: Allocator, io: Io, args: []const []const u8, sub:
     }
 
     if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "show")) {
-        // List platform tokens for this workspace.
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        try aw.writer.writeAll("{\"tokens\":[");
-        var first = true;
-        for (store.tokens.items) |t| {
-            if (!std.mem.eql(u8, t.workspace_id, workspace_id)) continue;
-            if (!first) try aw.writer.writeAll(",");
-            first = false;
-            try aw.writer.print("{{\"name\":{f},\"token\":{f},\"workspace_id\":{f}}}", .{
-                std.json.fmt(t.name, .{}),
-                std.json.fmt(t.token, .{}),
-                std.json.fmt(t.workspace_id, .{}),
-            });
-        }
-        try aw.writer.writeAll("]}");
-        try printStdoutLine(io, aw.written());
+        // Metadata only — raw secrets are not recoverable after minting.
+        const json = try store.listTokensJson(allocator, workspace_id);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
         return;
     }
 
@@ -584,7 +592,7 @@ fn runCloud(allocator: Allocator, io: Io, args: []const []const u8) !void {
     });
 
     // A fresh disk has no platform.json; say so plainly instead of 404-ing silently.
-    if (hub.platform.admin_token == null and hub.platform.workspaces.items.len == 0) {
+    if (hub.platform.admin_token_hash == null and hub.platform.workspaces.items.len == 0) {
         std.log.warn(
             "platform catalog {s}/platform.json is missing or empty — " ++
                 "run `synapse platform init --data-root {s}`; " ++
@@ -838,7 +846,13 @@ fn printHelp() !void {
         \\  synapse org create <name> --data-root <dir>
         \\  synapse workspace create <name> --org <org_id> --data-root <dir>
         \\  synapse token create [name] --workspace <ws_id> --data-root <dir> [--scope SCOPE]
+        \\  synapse token list --workspace <ws_id> --data-root <dir>
+        \\  synapse token revoke <token_id> --data-root <dir>
         \\  synapse cloud serve --data-root <dir> [--host 0.0.0.0] [--port 8787] [--workspace <ws_id>]
+        \\
+        \\  Tokens are stored as SHA-256 digests. The raw secret is printed once, at
+        \\  mint time; `token list` shows metadata only. Bootstrap a whole cloud with
+        \\  scripts/cloud_bootstrap.sh <data_root>, then open /cloud for the console.
         \\
         \\Env:
         \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens

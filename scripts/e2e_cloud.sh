@@ -3,19 +3,23 @@
 #
 # Asserts:
 #   - no dev-token-local written to cloud-scaffolded workspaces
-#   - no token → 401, not 200
-#   - dev-token-local Bearer rejected → 401
-#   - valid token for ws_a on ws_b → 403 (not 401, not 200)
-#   - valid token for ws_a on ws_a → 200
-#   - platform admin token works on control plane; non-admin → 403
+#   - no token -> 401, not 200
+#   - dev-token-local Bearer rejected -> 401
+#   - valid token for ws_a on ws_b -> 403 (not 401, not 200)
+#   - valid token for ws_a on ws_a -> 200
+#   - platform admin token works on control plane; non-admin -> 403
 #   - data written to ws_a is NOT visible from ws_b (store isolation)
 #   - cloud serve on non-loopback without SYNAPSE_REQUIRE_AUTH=1 exits non-zero
 #   - nested control-plane routes (orgs/{org}/workspaces[/{ws}/tokens]) are canonical
-#     and validate org→workspace ownership (wrong org → 404)
+#     and validate org->workspace ownership (wrong org -> 404)
 #   - flat control-plane aliases still work
-#   - scoped (non-admin) tokens are refused on out-of-scope verbs → 403
+#   - scoped (non-admin) tokens are refused on out-of-scope verbs -> 403
 #   - CLI-created workspaces are picked up without restarting the server
 #   - bare /v1/* routes to the default workspace (--workspace), and 404 without one
+#   - platform.json holds no raw token secrets (hash-at-rest)
+#   - token listings expose metadata only, never secrets
+#   - a revoked token is refused (401) and revocation survives a reload
+#   - per-workspace usage counters grow on ingest and recall
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -108,6 +112,48 @@ test -n "$TOK_B" || { echo "FAIL: no token for beta"; exit 1; }
 
 # ── Security invariants before server starts ──────────────────────────────────
 
+echo "==> platform.json stores digests, not raw secrets"
+test -f "$DATA/platform.json" || { echo "FAIL: no platform.json"; exit 1; }
+if grep -q '"token":' "$DATA/platform.json"; then
+    echo "FAIL: platform.json still has a plaintext \"token\" field"
+    exit 1
+fi
+if grep -q '"admin_token":' "$DATA/platform.json"; then
+    echo "FAIL: platform.json still has a plaintext \"admin_token\" field"
+    exit 1
+fi
+for secret in "$ADMIN_TOKEN" "$TOK_A" "$TOK_B"; do
+    if grep -qF "$secret" "$DATA/platform.json"; then
+        echo "FAIL: raw secret found in platform.json"
+        exit 1
+    fi
+done
+if grep -qE '"(p|sk)\.' "$DATA/platform.json"; then
+    echo "FAIL: a raw p./sk. token string is present in platform.json"
+    exit 1
+fi
+grep -q '"admin_token_hash"' "$DATA/platform.json" || { echo "FAIL: no admin_token_hash"; exit 1; }
+grep -q '"token_hash"' "$DATA/platform.json" || { echo "FAIL: no token_hash"; exit 1; }
+echo "ok   [platform.json is hash-at-rest]"
+
+echo "==> re-running platform init does not reprint the admin token"
+REINIT_OUT=$("$BIN" platform init --data-root "$DATA")
+echo "$REINIT_OUT" | grep -q '"admin_token":null' || {
+    echo "FAIL: second platform init leaked or rotated the admin token: $REINIT_OUT"
+    exit 1
+}
+echo "ok   [admin token shown only at creation]"
+
+echo "==> CLI token list returns metadata, never secrets"
+CLI_TOKENS=$("$BIN" token list --workspace "$WS_A" --data-root "$DATA")
+echo "$CLI_TOKENS"
+assert_contains "CLI token list has token ids" '"id":"tok_' "$CLI_TOKENS"
+if echo "$CLI_TOKENS" | grep -qF "$TOK_A"; then
+    echo "FAIL: CLI token list leaked the raw secret"
+    exit 1
+fi
+echo "ok   [CLI token list is metadata-only]"
+
 echo "==> no dev-token-local in cloud-scaffolded workspace files"
 if grep -r "dev-token-local" "$DATA/workspaces/" 2>/dev/null | grep -q .; then
     echo "FAIL: dev-token-local found in scaffolded workspaces"
@@ -145,47 +191,47 @@ echo "ok   [health returns mode:cloud]"
 
 # ── Auth matrix ───────────────────────────────────────────────────────────────
 
-echo "==> no token → 401"
+echo "==> no token -> 401"
 code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
 assert_code "no token on ws_a" "401" "$code"
 
-echo "==> dev-token-local bearer → 401"
+echo "==> dev-token-local bearer -> 401"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer dev-token-local" \
     "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
 assert_code "dev-token-local rejected" "401" "$code"
 
-echo "==> unknown token → 401"
+echo "==> unknown token -> 401"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer p.totallyunknowntoken" \
     "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
 assert_code "unknown token" "401" "$code"
 
-echo "==> ws_a token on ws_b → 403 (not 401)"
+echo "==> ws_a token on ws_b -> 403 (not 401)"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_A" \
     "http://127.0.0.1:8790/v1/w/$WS_B/workspace")
 assert_code "wrong-workspace token" "403" "$code"
 
-echo "==> ws_a token on ws_a → 200"
+echo "==> ws_a token on ws_a -> 200"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_A" \
     "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
 assert_code "correct workspace token" "200" "$code"
 
-echo "==> admin token on control plane → 200"
+echo "==> admin token on control plane -> 200"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     "http://127.0.0.1:8790/v1/platform/workspaces")
 assert_code "admin on control plane" "200" "$code"
 
-echo "==> workspace token on control plane → 403"
+echo "==> workspace token on control plane -> 403"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_A" \
     "http://127.0.0.1:8790/v1/platform/workspaces")
 assert_code "workspace token on control plane" "403" "$code"
 
-echo "==> no token on control plane → 401"
+echo "==> no token on control plane -> 401"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     "http://127.0.0.1:8790/v1/platform/workspaces")
 assert_code "no token on control plane" "401" "$code"
@@ -236,7 +282,7 @@ echo "ok   [admin sees both workspaces via flat alias]"
 
 # ── Nested control-plane routes ───────────────────────────────────────────────
 
-echo "==> nested GET /v1/platform/orgs/{org_id}/workspaces → 200"
+echo "==> nested GET /v1/platform/orgs/{org_id}/workspaces -> 200"
 NESTED_WS=$(curl -sf \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     "http://127.0.0.1:8790/v1/platform/orgs/$ORG_ID/workspaces")
@@ -245,7 +291,7 @@ echo "$NESTED_WS" | grep -q "\"$WS_A\"" || { echo "FAIL: ws_a not in nested org 
 echo "$NESTED_WS" | grep -q "\"$WS_B\"" || { echo "FAIL: ws_b not in nested org listing"; exit 1; }
 echo "ok   [nested org workspace list returns both workspaces]"
 
-echo "==> nested GET with wrong org → 404"
+echo "==> nested GET with wrong org -> 404"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     "http://127.0.0.1:8790/v1/platform/orgs/org_doesnotexist_xxx/workspaces")
@@ -262,7 +308,7 @@ WS_C=$(echo "$GAMMA_OUT" | grep -o '"workspace_id":"[^"]*"' | cut -d'"' -f4)
 test -n "$WS_C" || { echo "FAIL: no workspace_id for gamma"; exit 1; }
 echo "ok   [nested workspace create returned workspace_id=$WS_C]"
 
-echo "==> nested POST with wrong org → 404"
+echo "==> nested POST with wrong org -> 404"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -282,7 +328,7 @@ TOK_C=$(echo "$TOK_C_OUT" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 test -n "$TOK_C" || { echo "FAIL: no token returned for gamma"; exit 1; }
 echo "ok   [nested token mint returned token for gamma]"
 
-echo "==> nested token mint with wrong org → 404"
+echo "==> nested token mint with wrong org -> 404"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -291,7 +337,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" \
     "http://127.0.0.1:8790/v1/platform/orgs/org_wrongone_xxx/workspaces/$WS_C/tokens")
 assert_code "nested wrong org token mint" "404" "$code"
 
-echo "==> nested token mint with unknown scope → 400"
+echo "==> nested token mint with unknown scope -> 400"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -310,7 +356,7 @@ assert_code "gamma EVENTS:WRITE ingest" "200" "$ingest_c"
 
 # ── Legacy /v1/* routing via default workspace ────────────────────────────────
 
-echo "==> gamma EVENTS:WRITE token cannot use an admin verb → 403"
+echo "==> gamma EVENTS:WRITE token cannot use an admin verb -> 403"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST "http://127.0.0.1:8790/v1/w/$WS_C/reload" \
     -H "Authorization: Bearer $TOK_C")
@@ -331,6 +377,142 @@ code=$(curl -s -o /dev/null -w "%{http_code}" \
     "http://127.0.0.1:8790/v1/w/$WS_D/workspace")
 assert_code "CLI-created workspace hot-reloaded" "200" "$code"
 
+# ── Token listing and revocation ──────────────────────────────────────────────
+
+echo "==> GET /v1/platform/tokens?workspace_id= returns metadata only"
+TOKEN_LIST=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://127.0.0.1:8790/v1/platform/tokens?workspace_id=$WS_A")
+echo "$TOKEN_LIST"
+assert_contains "token listing has ids" '"id":"tok_' "$TOKEN_LIST"
+assert_contains "token listing has revoked flag" '"revoked":false' "$TOKEN_LIST"
+if echo "$TOKEN_LIST" | grep -qF "$TOK_A"; then
+    echo "FAIL: token listing leaked a raw secret"
+    exit 1
+fi
+if echo "$TOKEN_LIST" | grep -q "\"$WS_B\""; then
+    echo "FAIL: workspace_id filter leaked another workspace's tokens"
+    exit 1
+fi
+echo "ok   [token listing is metadata-only and filtered]"
+
+echo "==> mint a throwaway token, revoke it over HTTP, confirm it stops working"
+REVOKE_OUT=$(curl -sf -X POST \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "content-type: application/json" \
+    -d "{\"workspace_id\":\"$WS_A\",\"name\":\"doomed\",\"scope\":\"ADMIN\"}" \
+    "http://127.0.0.1:8790/v1/platform/tokens")
+echo "$REVOKE_OUT"
+TOK_R=$(echo "$REVOKE_OUT" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+TOK_R_ID=$(echo "$REVOKE_OUT" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+test -n "$TOK_R" -a -n "$TOK_R_ID" || { echo "FAIL: mint did not return token + id"; exit 1; }
+
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOK_R" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "fresh token works before revoke" "200" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://127.0.0.1:8790/v1/platform/tokens/$TOK_R_ID/revoke")
+assert_code "revoke returns 200" "200" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOK_R" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "revoked token rejected" "401" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://127.0.0.1:8790/v1/platform/tokens/tok_doesnotexist/revoke")
+assert_code "revoke unknown token id" "404" "$code"
+
+echo "==> CLI revoke is picked up by the running server"
+TOK_CLI_OUT=$("$BIN" token create cli_doomed --workspace "$WS_A" --scope ADMIN --data-root "$DATA")
+TOK_CLI=$(echo "$TOK_CLI_OUT" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+TOK_CLI_ID=$(echo "$TOK_CLI_OUT" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+test -n "$TOK_CLI" -a -n "$TOK_CLI_ID" || { echo "FAIL: CLI mint did not return token + id"; exit 1; }
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOK_CLI" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "CLI-minted token works" "200" "$code"
+"$BIN" token revoke "$TOK_CLI_ID" --data-root "$DATA"
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOK_CLI" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "CLI-revoked token rejected without restart" "401" "$code"
+
+echo "==> revoked tokens stay revoked on disk"
+grep -q '"revoked":true' "$DATA/platform.json" || { echo "FAIL: revocation not persisted"; exit 1; }
+echo "ok   [revocation persisted to platform.json]"
+
+# ── Usage metering ────────────────────────────────────────────────────────────
+
+usage_field() {
+    python3 -c '
+import json, sys
+doc = json.loads(sys.argv[1])
+for w in doc.get("workspaces", []):
+    if w.get("workspace_id") == sys.argv[2]:
+        print(w.get(sys.argv[3], 0))
+        break
+else:
+    print(0)
+' "$1" "$2" "$3"
+}
+
+echo "==> usage counters exist for alpha"
+USAGE_BEFORE=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8790/v1/platform/usage")
+echo "$USAGE_BEFORE"
+REQ_BEFORE=$(usage_field "$USAGE_BEFORE" "$WS_A" requests)
+EVENTS_BEFORE=$(usage_field "$USAGE_BEFORE" "$WS_A" ingest_events)
+BYTES_BEFORE=$(usage_field "$USAGE_BEFORE" "$WS_A" ingest_bytes)
+[ "$REQ_BEFORE" -gt 0 ] || { echo "FAIL: no requests counted for alpha"; exit 1; }
+echo "ok   [alpha usage: requests=$REQ_BEFORE events=$EVENTS_BEFORE bytes=$BYTES_BEFORE]"
+
+echo "==> ingest + recall increase alpha's counters"
+curl -sf -o /dev/null -X POST "http://127.0.0.1:8790/v1/w/$WS_A/events/harness_events" \
+    -H "Authorization: Bearer $TOK_A" \
+    -H "content-type: application/x-ndjson" \
+    -d "{\"ts\":\"2026-01-01T00:00:01Z\",\"run_id\":\"$PROBE_RUN\",\"agent_id\":\"agent_1\",\"type\":\"plan_step\",\"payload\":{\"task_id\":\"t2\",\"name\":\"n2\"}}"
+curl -sf -o /dev/null -H "Authorization: Bearer $TOK_A" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/recall?run_id=$PROBE_RUN&query=risk"
+
+USAGE_AFTER=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:8790/v1/platform/usage")
+echo "$USAGE_AFTER"
+REQ_AFTER=$(usage_field "$USAGE_AFTER" "$WS_A" requests)
+EVENTS_AFTER=$(usage_field "$USAGE_AFTER" "$WS_A" ingest_events)
+BYTES_AFTER=$(usage_field "$USAGE_AFTER" "$WS_A" ingest_bytes)
+[ "$REQ_AFTER" -gt "$REQ_BEFORE" ] || { echo "FAIL: requests did not increase ($REQ_BEFORE -> $REQ_AFTER)"; exit 1; }
+[ "$EVENTS_AFTER" -gt "$EVENTS_BEFORE" ] || { echo "FAIL: ingest_events did not increase ($EVENTS_BEFORE -> $EVENTS_AFTER)"; exit 1; }
+[ "$BYTES_AFTER" -gt "$BYTES_BEFORE" ] || { echo "FAIL: ingest_bytes did not increase ($BYTES_BEFORE -> $BYTES_AFTER)"; exit 1; }
+echo "ok   [alpha usage grew: requests $REQ_BEFORE->$REQ_AFTER events $EVENTS_BEFORE->$EVENTS_AFTER bytes $BYTES_BEFORE->$BYTES_AFTER]"
+
+echo "==> usage is persisted and per-workspace"
+test -f "$DATA/usage.json" || { echo "FAIL: usage.json not written"; exit 1; }
+grep -q "\"$WS_A\"" "$DATA/usage.json" || { echo "FAIL: alpha missing from usage.json"; exit 1; }
+BETA_EVENTS=$(usage_field "$USAGE_AFTER" "$WS_B" ingest_events)
+[ "$BETA_EVENTS" -eq 0 ] || { echo "FAIL: beta was charged for alpha's ingest"; exit 1; }
+echo "ok   [usage.json persisted; beta not charged for alpha's ingest]"
+
+echo "==> usage requires an admin token"
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOK_A" \
+    "http://127.0.0.1:8790/v1/platform/usage")
+assert_code "workspace token on usage" "403" "$code"
+
+# ── Cloud admin console ───────────────────────────────────────────────────────
+
+echo "==> /cloud serves the admin console"
+CLOUD_HTML=$(curl -sf "http://127.0.0.1:8790/cloud")
+assert_contains "/cloud is the admin console" "SYNAPSE CLOUD" "$CLOUD_HTML"
+CLOUD_HTML_ALT=$(curl -sf "http://127.0.0.1:8790/ui/cloud")
+assert_contains "/ui/cloud is the same console" "SYNAPSE CLOUD" "$CLOUD_HTML_ALT"
+if echo "$CLOUD_HTML" | grep -qE '(p|sk)\.[0-9a-f]{32}'; then
+    echo "FAIL: /cloud page embeds a token"
+    exit 1
+fi
+echo "ok   [/cloud ships no secrets]"
+
 # ── Legacy /v1/* routing via default workspace ────────────────────────────────
 
 echo "==> start second cloud server with SYNAPSE_WORKSPACE=$WS_A (legacy path test)"
@@ -339,28 +521,28 @@ SYNAPSE_REQUIRE_AUTH=1 SYNAPSE_WORKSPACE="$WS_A" \
 LEGACY_PID=$!
 sleep 0.6
 
-echo "==> legacy /v1/workspace with valid token on default workspace → 200"
+echo "==> legacy /v1/workspace with valid token on default workspace -> 200"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_A" \
     "http://127.0.0.1:8793/v1/workspace")
 assert_code "legacy /v1/workspace with default workspace" "200" "$code"
 
-echo "==> legacy /v1/workspace no token → 401"
+echo "==> legacy /v1/workspace no token -> 401"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     "http://127.0.0.1:8793/v1/workspace")
 assert_code "legacy /v1/workspace no token" "401" "$code"
 
-echo "==> legacy /v1/workspace ws_b token on ws_a default → 403"
+echo "==> legacy /v1/workspace ws_b token on ws_a default -> 403"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_B" \
     "http://127.0.0.1:8793/v1/workspace")
 assert_code "legacy /v1/workspace wrong workspace token" "403" "$code"
 
-echo "==> /v1/workspace without SYNAPSE_WORKSPACE set → 404"
+echo "==> /v1/workspace without SYNAPSE_WORKSPACE set -> 404"
 code=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer $TOK_A" \
     "http://127.0.0.1:8790/v1/workspace")
-assert_code "no default workspace → 404" "404" "$code"
+assert_code "no default workspace -> 404" "404" "$code"
 
 echo "==> legacy /v1/* serves the default workspace's own data"
 LEGACY_RESP=$(curl -sf -X POST "http://127.0.0.1:8793/v1/query" \
