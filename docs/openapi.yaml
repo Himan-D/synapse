@@ -3,11 +3,24 @@ info:
   title: Synapse HTTP API
   description: |
     Local-first real-time data platform for AI harnesses.
-    Datasource → Pipe → Endpoint / MCP. See docs/PRODUCTION_PLAN.md.
+    Datasource → Pipe → Endpoint / MCP. See docs/PRODUCTION_PLAN.md and docs/CLOUD.md.
+
+    ## URL patterns (Phase C)
+
+    | Mode | Prefix | Notes |
+    |---|---|---|
+    | Legacy / single-root | `/v1/*` | Default workspace — same as `synapse dev`. All paths below apply. |
+    | Multi-workspace | `/v1/w/{workspace_id}/*` | All verb paths under `/v1/` also exist under this prefix, scoped to a workspace. Token must match the workspace. |
+    | Control plane | `/v1/platform/*` | Admin-token only. Org/workspace/token management. |
+
+    For multi-workspace deployments, use `/v1/w/{workspace_id}/recall` etc.
+    The control-plane endpoints (`/v1/platform/*`) are only available in `synapse cloud serve` mode.
   version: 0.1.0
 servers:
   - url: http://127.0.0.1:8787
     description: Default local `synapse dev`
+  - url: https://your-service.onrender.com
+    description: Render cloud deployment (`synapse cloud serve`)
 paths:
   /health:
     get:
@@ -348,12 +361,231 @@ paths:
       responses:
         "200": { description: Updated run }
 
+  # ── Multi-workspace routing ────────────────────────────────────────────────
+  # All /v1/* verb paths also exist under /v1/w/{workspace_id}/* scoped to a
+  # specific workspace.  The examples below show the workspace-scoped variants
+  # for the most common verbs; replace {workspace_id} with your workspace slug.
+
+  /v1/w/{workspace_id}/events/{datasource}:
+    post:
+      summary: Ingest NDJSON events (workspace-scoped)
+      tags: [multi-workspace]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+          description: Workspace identifier
+        - name: datasource
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: { type: string }
+          text/plain:
+            schema: { type: string }
+      responses:
+        "200": { description: Ingested count }
+        "401": { description: Missing or invalid token }
+        "403": { description: Token workspace mismatch }
+        "413": { description: Body exceeds 16 MiB }
+
+  /v1/w/{workspace_id}/recall:
+    get:
+      summary: Token-budgeted context pack (workspace-scoped)
+      tags: [multi-workspace]
+      parameters:
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: query, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Context pack }
+        "403": { description: Token workspace mismatch }
+
+  /v1/w/{workspace_id}/remember:
+    post:
+      summary: Store a Mind claim (workspace-scoped)
+      tags: [multi-workspace]
+      parameters:
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, text]
+              properties:
+                run_id: { type: string }
+                agent_id: { type: string }
+                text: { type: string }
+                confidence: { type: number }
+      responses:
+        "200": { description: Stored }
+        "403": { description: Token workspace mismatch }
+
+  /v1/w/{workspace_id}/mcp:
+    post:
+      summary: MCP JSON-RPC (workspace-scoped)
+      tags: [multi-workspace]
+      parameters:
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: JSON-RPC response }
+
+  # ── Control plane (Phase C — `synapse cloud serve` only) ──────────────────
+  # All control-plane routes require an admin token.
+
+  /v1/platform/orgs:
+    get:
+      summary: List organizations
+      tags: [control-plane]
+      responses:
+        "200":
+          description: Array of org objects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orgs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Org'
+        "401": { description: Admin token required }
+    post:
+      summary: Create organization
+      tags: [control-plane]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        "200":
+          description: Created org
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Org' }
+        "401": { description: Admin token required }
+        "409": { description: Name already exists }
+
+  /v1/platform/orgs/{org_id}/workspaces:
+    get:
+      summary: List workspaces in org
+      tags: [control-plane]
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Array of workspace objects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workspaces:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Workspace'
+        "401": { description: Admin token required }
+        "404": { description: Unknown org }
+    post:
+      summary: Create workspace in org
+      tags: [control-plane]
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        "200":
+          description: Created workspace + admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceCreated' }
+        "401": { description: Admin token required }
+        "404": { description: Unknown org }
+
+  /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens:
+    post:
+      summary: Mint scoped token for workspace
+      tags: [control-plane]
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+        - { name: workspace_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                scopes:
+                  type: array
+                  items: { type: string, enum: [EVENTS:WRITE, PIPES:READ, MIND:READ, MIND:WRITE, ADMIN] }
+                  default: [EVENTS:WRITE, PIPES:READ, MIND:READ, MIND:WRITE]
+      responses:
+        "200":
+          description: Minted token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  name: { type: string }
+                  workspace_id: { type: string }
+                  scopes: { type: array, items: { type: string } }
+        "401": { description: Admin token required }
+        "404": { description: Unknown workspace }
+
 components:
+  schemas:
+    Org:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Workspace:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        org_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    WorkspaceCreated:
+      type: object
+      properties:
+        workspace: { $ref: '#/components/schemas/Workspace' }
+        admin_token: { type: string }
+        data_path: { type: string }
+
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Scoped workspace token. Enable with SYNAPSE_REQUIRE_AUTH=1.
+      description: |
+        Scoped workspace token. Enable with SYNAPSE_REQUIRE_AUTH=1.
+        In Phase C cloud mode tokens carry org_id, workspace_id, and scopes.
+        Workspace-scoped tokens must match the {workspace_id} in the URL path.
     queryToken:
       type: apiKey
       in: query

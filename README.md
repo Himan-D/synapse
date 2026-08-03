@@ -4,7 +4,7 @@
 
 > NetworkX computes on graphs. Neo4j stores graphs. Synapse runs agents on graphs.
 
-See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/WORKFLOWS.md](docs/WORKFLOWS.md), [docs/openapi.yaml](docs/openapi.yaml), and [docs/architecture.md](docs/architecture.md).
+See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/WORKFLOWS.md](docs/WORKFLOWS.md), [docs/openapi.yaml](docs/openapi.yaml), [docs/architecture.md](docs/architecture.md), and **[docs/CLOUD.md](docs/CLOUD.md)** for Render/Docker cloud deploy.
 
 ## Requirements
 
@@ -118,6 +118,22 @@ print(s.recall("run_demo", query="risk"))
 print(s.plan("fix risk bug", run_id="run_demo"))
 s.remember("run_demo", "margin risk is elevated", confidence=0.9)
 ```
+
+## Cloud Deploy (Render)
+
+```bash
+# Build image locally
+docker build -t synapse:local .
+
+# One-click Render deploy: push repo → Render dashboard → New → Blueprint
+# render.yaml is at the repo root; see docs/CLOUD.md for full setup guide.
+```
+
+See **[docs/CLOUD.md](docs/CLOUD.md)** for:
+- Render Blueprint deploy steps
+- URL map (`/v1/*` vs `/v1/w/{id}/*` vs `/v1/platform/*`)
+- Migration from single-root local
+- Environment variables reference
 
 ## Develop
 

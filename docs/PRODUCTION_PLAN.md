@@ -98,11 +98,32 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 
 ### Phase C — Platform / cloud beta
 
-- Hosted workspaces, branch remote sync  
-- Multi-tenant auth (org → workspace → token)  
-- Managed MCP + HTTPS endpoints  
-- Usage metering + billing hooks  
-- Regional durability (object store + Postgres metadata)  
+**Status: in progress** — render-pack shipped; platform/http/cli implementation ongoing.
+
+#### Shipped (this pass)
+
+- [x] `Dockerfile` — Zig 0.16 multi-stage build; `synapse cloud serve`; binds `0.0.0.0:$PORT`; data at `/data`; `EXPOSE 8787`
+- [x] `render.yaml` — Render Blueprint: Web Service + persistent disk `/data`; `SYNAPSE_REQUIRE_AUTH=1`; optional `SYNAPSE_RATE_LIMIT`
+- [x] `docs/CLOUD.md` — Deploy guide: Render Blueprint, URL map, bootstrap, migration from single-root, storage seams
+- [x] `docs/openapi.yaml` — Platform control-plane routes + `/v1/w/{workspace_id}/*` workspace paths documented
+- [x] URL contract locked: `/v1/*` (legacy), `/v1/w/{workspace_id}/*` (multi), `/v1/platform/*` (control plane)
+
+#### In progress
+
+- [ ] `platform.zig` + `workspace_hub.zig` — org/workspace/token store + lazy multi-root (todo: platform-store)
+- [ ] HTTP routing — `/v1/w/{id}/*` prefix stripping + workspace resolver (todo: http-routing)
+- [ ] CLI: `synapse platform init`, `org create`, `workspace create`, `token create`, `cloud serve` (todo: cli-cloud)
+
+#### Pending (Phase C)
+
+- [ ] Isolation tests + multi-workspace e2e (todo: verify-multi)
+- [ ] Webhook retry/backoff drain worker (Phase B carry-over)
+- [ ] HTTPS webhook delivery (Phase B carry-over)
+
+#### Explicitly out of scope (Phase D+)
+
+- Stripe billing, SSO, multi-region HA, Kafka/ClickHouse  
+- Postgres MetaStore swap, S3/R2 EventStore swap (seams documented in CLOUD.md §8)
 
 ### Phase D — Category expansion
 

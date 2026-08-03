@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const workspace_mod = @import("../core/workspace.zig");
+const hub_mod = @import("../core/workspace_hub.zig");
 const mcp_mod = @import("mcp.zig");
 const format_mod = @import("../core/format.zig");
 const query_mod = @import("../core/query.zig");
@@ -23,8 +24,6 @@ var g_shutdown: std.atomic.Value(bool) = .init(false);
 
 fn onSignal(_: std.posix.SIG) callconv(.c) void {
     g_shutdown.store(true, .seq_cst);
-    // Prefer shutdown over close: Zig's Io treats BADF as a programmer bug,
-    // while shutdown is the documented accept-cancellation mechanism.
     const fd = g_listen_fd.load(.seq_cst);
     if (fd >= 0) {
         _ = std.c.shutdown(fd, std.posix.SHUT.RDWR);
@@ -85,7 +84,6 @@ fn pipesDirMtime(io: Io, root: []const u8) i128 {
 fn maybeReloadPipes(io: Io, ws: *workspace_mod.Workspace, last_mtime: *i128) void {
     const m = pipesDirMtime(io, ws.root);
     if (m == 0 or m <= last_mtime.*) return;
-    // Debounce: only reload if mtime advanced.
     last_mtime.* = m;
     ws.reloadPipes() catch |err| {
         std.log.warn("pipe reload failed: {s}", .{@errorName(err)});
@@ -93,6 +91,8 @@ fn maybeReloadPipes(io: Io, ws: *workspace_mod.Workspace, last_mtime: *i128) voi
     };
     std.log.info("pipes reloaded (mtime watch)", .{});
 }
+
+// ── Single-workspace serve (dev mode) ────────────────────────────────────────
 
 pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, config: ServeConfig) !void {
     g_shutdown.store(false, .seq_cst);
@@ -146,6 +146,58 @@ pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, config:
     std.log.info("synapse shutdown complete", .{});
 }
 
+// ── Multi-workspace serve (cloud mode) ───────────────────────────────────────
+
+pub fn serveCloud(allocator: Allocator, io: Io, hub: *hub_mod.WorkspaceHub, config: ServeConfig) !void {
+    g_shutdown.store(false, .seq_cst);
+    installSignalHandlers();
+
+    const address = try Io.net.IpAddress.parseIp4(config.host, config.port);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    g_listen_fd.store(server.socket.handle, .seq_cst);
+    defer g_listen_fd.store(-1, .seq_cst);
+
+    if (!isLoopbackHost(config.host) and !envTruthy("SYNAPSE_REQUIRE_AUTH")) {
+        std.log.warn("binding {s}:{d} without SYNAPSE_REQUIRE_AUTH=1 — tokens not enforced (cloud mode)", .{ config.host, config.port });
+    }
+    std.log.info("synapse cloud listening on http://{s}:{d} version={s}", .{ config.host, config.port, version_mod.version });
+
+    var limiter: ?ratelimit_mod.Limiter = null;
+    const rate = envRateLimit();
+    if (rate > 0) {
+        limiter = ratelimit_mod.Limiter.init(allocator, rate, @max(rate, 1));
+        std.log.info("rate limit enabled: {d:.1} req/s", .{rate});
+    }
+    defer if (limiter) |*l| l.deinit();
+
+    while (!g_shutdown.load(.seq_cst)) {
+        // Tick durable workflows across all loaded workspaces.
+        hub.tickAll();
+
+        var stream = server.accept(io) catch |err| {
+            if (g_shutdown.load(.seq_cst)) break;
+            switch (err) {
+                error.SocketNotListening => break,
+                error.ConnectionAborted => continue,
+                else => {
+                    if (g_shutdown.load(.seq_cst)) break;
+                    std.log.err("accept failed: {s}", .{@errorName(err)});
+                    continue;
+                },
+            }
+        };
+
+        handleConnCloud(allocator, io, hub, &stream, config.max_body_bytes, if (limiter) |*l| l else null) catch |err| {
+            std.log.err("request failed: {s}", .{@errorName(err)});
+        };
+        stream.close(io);
+    }
+    std.log.info("synapse cloud shutdown complete", .{});
+}
+
+// ── Request metadata ─────────────────────────────────────────────────────────
+
 const RequestMeta = struct {
     id_buf: [36]u8 = undefined,
     id: []const u8 = "",
@@ -193,7 +245,6 @@ fn logAccess(io: Io, meta: *const RequestMeta) void {
     const now = Io.Clock.real.now(io);
     const dur_ms = @max(now.toMilliseconds() - meta.started.toMilliseconds(), 0);
     const ts = @max(now.toSeconds(), 0);
-    // Structured JSON access log (one line).
     std.log.info(
         \\{{"ts":{d},"request_id":"{s}","method":"{s}","path":"{s}","status":{d},"duration_ms":{d}}}
     ,
@@ -217,6 +268,8 @@ fn respond(
         },
     });
 }
+
+// ── Single-workspace connection handler ───────────────────────────────────────
 
 fn handleConn(
     allocator: Allocator,
@@ -287,36 +340,308 @@ fn handleConn(
         return;
     }
 
+    try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body);
+}
+
+// ── Multi-workspace connection handler ────────────────────────────────────────
+
+fn handleConnCloud(
+    allocator: Allocator,
+    io: Io,
+    hub: *hub_mod.WorkspaceHub,
+    stream: *Io.net.Stream,
+    max_body: usize,
+    limiter: ?*ratelimit_mod.Limiter,
+) !void {
+    var in_buf: [64 * 1024]u8 = undefined;
+    var out_buf: [64 * 1024]u8 = undefined;
+    var stream_reader = stream.reader(io, &in_buf);
+    var stream_writer = stream.writer(io, &out_buf);
+
+    var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+    var request = try http_server.receiveHead();
+
+    const method = request.head.method;
+    const target = request.head.target;
+    const path = pathOnlyStr(target);
+
+    var meta: RequestMeta = .{
+        .started = Io.Clock.real.now(io),
+        .method = @tagName(method),
+        .path = path,
+    };
+    if (extractIncomingRequestId(request.head_buffer)) |incoming| {
+        const n = @min(incoming.len, meta.id_buf.len);
+        @memcpy(meta.id_buf[0..n], incoming[0..n]);
+        meta.id = meta.id_buf[0..n];
+    } else {
+        meta.id = newRequestId(io, &meta.id_buf);
+    }
+    defer logAccess(io, &meta);
+
+    // Standard health/ready (no workspace context needed).
+    if (method == .GET and std.mem.eql(u8, path, "/health")) {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf,
+            \\{{"ok":true,"product":"{s}","version":"{s}","mode":"cloud"}}
+            \\
+        , .{ version_mod.product, version_mod.version });
+        try respond(&request, &meta, body, .ok, "application/json");
+        return;
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/ready")) {
+        var buf: [128]u8 = undefined;
+        const n_ws = hub.platform.workspaces.items.len;
+        const body = try std.fmt.bufPrint(&buf, "{{\"ready\":true,\"workspaces\":{d}}}\n", .{n_ws});
+        try respond(&request, &meta, body, .ok, "application/json");
+        return;
+    }
+
+    // Rate limiting.
+    if (limiter) |lim| {
+        const key = auth_mod.Auth.extractPresentedToken(request.head_buffer) orelse "anon";
+        const now_ns = Io.Clock.real.now(io).toNanoseconds();
+        if (!lim.allow(key, now_ns)) {
+            try respond(&request, &meta, "{\"error\":\"rate_limited\"}\n", .too_many_requests, "application/json");
+            return;
+        }
+    }
+
+    // Platform control plane: /v1/platform/*
+    if (std.mem.startsWith(u8, path, "/v1/platform")) {
+        const require_auth = envTruthy("SYNAPSE_REQUIRE_AUTH");
+        if (require_auth and !hub.isAdminRequest(request.head_buffer)) {
+            try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
+            return;
+        }
+        try platformControlPlane(allocator, io, hub, &request, &meta, path, target, max_body);
+        return;
+    }
+
+    // Workspace routing: /v1/w/{workspace_id}/...
+    // After stripping "/v1/w/{id}", prepend "/v1" so handlers see standard paths.
+    if (std.mem.startsWith(u8, path, "/v1/w/")) {
+        const after_w = path["/v1/w/".len..];
+        const slash_pos = std.mem.indexOfScalar(u8, after_w, '/');
+        const workspace_id = if (slash_pos) |sp| after_w[0..sp] else after_w;
+        if (!safe_name.isSafeName(workspace_id)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_workspace_id\"}\n", .bad_request, "application/json");
+            return;
+        }
+
+        const ws = (hub.get(workspace_id) catch |err| switch (err) {
+            error.FileNotFound => {
+                try respond(&request, &meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
+                return;
+            },
+            else => |e| return e,
+        }) orelse {
+            try respond(&request, &meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
+            return;
+        };
+
+        // Build rewritten path: strip "/v1/w/{id}" and prepend "/v1".
+        const prefix_len = "/v1/w/".len + workspace_id.len;
+        const remainder = if (slash_pos != null) path[prefix_len..] else "/";
+        const rewritten_path = try std.fmt.allocPrint(allocator, "/v1{s}", .{remainder});
+        defer allocator.free(rewritten_path);
+
+        // Build rewritten target (includes query string).
+        const rewritten_target: []u8 = blk: {
+            const q = std.mem.indexOfScalar(u8, target, '?');
+            if (q) |qi| {
+                break :blk try std.fmt.allocPrint(allocator, "/v1{s}?{s}", .{ remainder, target[qi + 1 ..] });
+            }
+            break :blk try std.fmt.allocPrint(allocator, "/v1{s}", .{remainder});
+        };
+        defer allocator.free(rewritten_target);
+
+        // Auth: workspace tokens OR platform-scoped tokens.
+        const require_auth = envTruthy("SYNAPSE_REQUIRE_AUTH");
+        if (require_auth and !hub.authorizeForWorkspace(ws, workspace_id, request.head_buffer, method, rewritten_path)) {
+            try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
+            return;
+        }
+
+        try routeWorkspace(allocator, io, ws, &request, &meta, rewritten_path, rewritten_target, max_body);
+        return;
+    }
+
+    try respond(&request, &meta,
+        \\{"error":"not_found","hint":"Use /v1/w/{workspace_id}/... or /v1/platform/..."}
+        \\
+    , .not_found, "application/json");
+}
+
+// ── Platform control plane handlers ──────────────────────────────────────────
+
+fn platformControlPlane(
+    allocator: Allocator,
+    io: Io,
+    hub: *hub_mod.WorkspaceHub,
+    request: *std.http.Server.Request,
+    meta: *RequestMeta,
+    path: []const u8,
+    _target: []const u8,
+    max_body: usize,
+) !void {
+    _ = io;
+    _ = _target;
+
+    // GET /v1/platform/orgs
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/orgs")) {
+        const json = try hub.platform.listOrgsJson(allocator);
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    // POST /v1/platform/orgs  — body: {"name": "..."}
+    if (request.head.method == .POST and std.mem.eql(u8, path, "/v1/platform/orgs")) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const name = parsed.value.object.get("name").?.string;
+        const json = hub.platform.createOrg(name) catch |err| switch (err) {
+            error.OrgAlreadyExists => {
+                try respond(request, meta, "{\"error\":\"org_already_exists\"}\n", .conflict, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    // GET /v1/platform/workspaces
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/workspaces")) {
+        const json = try hub.platform.listWorkspacesJson(allocator);
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    // POST /v1/platform/workspaces  — body: {"name": "...", "org_id": "..."}
+    if (request.head.method == .POST and std.mem.eql(u8, path, "/v1/platform/workspaces")) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const name = parsed.value.object.get("name").?.string;
+        const org_id = parsed.value.object.get("org_id").?.string;
+        const json = hub.platform.createWorkspace(org_id, name) catch |err| switch (err) {
+            error.OrgNotFound => {
+                try respond(request, meta, "{\"error\":\"org_not_found\"}\n", .bad_request, "application/json");
+                return;
+            },
+            error.WorkspaceAlreadyExists => {
+                try respond(request, meta, "{\"error\":\"workspace_already_exists\"}\n", .conflict, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+
+        // Scaffold workspace directory.
+        var ws_id_parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer ws_id_parsed.deinit();
+        const ws_id = ws_id_parsed.value.object.get("workspace_id").?.string;
+        hub.scaffoldWorkspace(ws_id, name) catch |err| {
+            std.log.warn("workspace scaffold failed for {s}: {s}", .{ ws_id, @errorName(err) });
+        };
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    // POST /v1/platform/tokens  — body: {"workspace_id": "...", "name": "...", "scope": "..."}
+    if (request.head.method == .POST and std.mem.eql(u8, path, "/v1/platform/tokens")) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const workspace_id = obj.get("workspace_id").?.string;
+        const name = (obj.get("name") orelse .{ .string = "api" }).string;
+        const scope = (obj.get("scope") orelse .{ .string = "ADMIN" }).string;
+        const json = hub.platform.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+            error.WorkspaceNotFound => {
+                try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .bad_request, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
+    try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
+}
+
+// ── Workspace request dispatcher (shared by single and multi mode) ────────────
+
+fn routeWorkspace(
+    allocator: Allocator,
+    io: Io,
+    ws: *workspace_mod.Workspace,
+    request: *std.http.Server.Request,
+    meta: *RequestMeta,
+    path: []const u8,
+    target: []const u8,
+    max_body: usize,
+) !void {
+    const method = request.head.method;
+
     if (method == .GET and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/ui") or std.mem.eql(u8, path, "/ui/"))) {
         const html = try loadUiHtml(allocator, io, ws.root);
         defer allocator.free(html);
-        try respond(&request, &meta, html, .ok, "text/html; charset=utf-8");
+        try respond(request, meta, html, .ok, "text/html; charset=utf-8");
         return;
     }
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/workspace")) {
         const json = try ws.listPipesJson(allocator);
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/endpoints")) {
         const json = try ws.listEndpointsJson(allocator);
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
 
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/events/")) {
         const ds = path["/v1/events/".len..];
         if (!safe_name.isSafeName(ds)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
             return;
         }
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -324,7 +649,7 @@ fn handleConn(
         defer allocator.free(body);
         const n = ws.store.ingestNdjson(ds, body) catch |err| switch (err) {
             error.SchemaViolation, error.InvalidJson, error.MissingField => {
-                try respond(&request, &meta, "{\"error\":\"schema_violation\"}\n", .bad_request, "application/json");
+                try respond(request, meta, "{\"error\":\"schema_violation\"}\n", .bad_request, "application/json");
                 return;
             },
             else => |e| return e,
@@ -333,14 +658,14 @@ fn handleConn(
         ws.logOp("ingest", ds, "ok");
         var resp_buf: [64]u8 = undefined;
         const resp = try std.fmt.bufPrint(&resp_buf, "{{\"ingested\":{d}}}\n", .{n});
-        try respond(&request, &meta, resp, .ok, "application/json");
+        try respond(request, meta, resp, .ok, "application/json");
         return;
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/query")) {
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -351,7 +676,7 @@ fn handleConn(
         const obj = parsed.value.object;
         const ds = obj.get("datasource").?.string;
         if (!safe_name.isSafeName(ds)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
             return;
         }
         var where: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -380,23 +705,23 @@ fn handleConn(
         const json = try query_mod.runQuery(allocator, &ws.store, ds, where, limit_raw, offset_raw);
         defer allocator.free(json);
         ws.logOp("query", ds, "ok");
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
 
     if (method == .GET and std.mem.startsWith(u8, path, "/v1/datasources/") and std.mem.endsWith(u8, path, "/data")) {
         const mid = path["/v1/datasources/".len .. path.len - "/data".len];
         if (!safe_name.isSafeName(mid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
             return;
         }
-        return runDatasourceQuery(allocator, &request, &meta, ws, mid, target);
+        return runDatasourceQuery(allocator, request, meta, ws, mid, target);
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) {
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -416,41 +741,41 @@ fn handleConn(
         const json = try ws.remember(run_id, agent_id, text, confidence);
         defer allocator.free(json);
         ws.logOp("remember", run_id, "ok");
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
 
     if (method == .GET and std.mem.startsWith(u8, path, "/v1/pipes/")) {
         const tail = path["/v1/pipes/".len..];
         const split = format_mod.splitNameFormat(tail);
-        return runAlias(allocator, &request, &meta, ws, split.name, target, split.format);
+        return runAlias(allocator, request, meta, ws, split.name, target, split.format);
     }
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/recall")) {
-        return runAlias(allocator, &request, &meta, ws, "recall_context", target, null);
+        return runAlias(allocator, request, meta, ws, "recall_context", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/tool_failure_rate")) {
-        return runAlias(allocator, &request, &meta, ws, "tool_failure_rate", target, null);
+        return runAlias(allocator, request, meta, ws, "tool_failure_rate", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/metrics/llm_tokens")) {
-        return runAlias(allocator, &request, &meta, ws, "llm_token_burn", target, null);
+        return runAlias(allocator, request, meta, ws, "llm_token_burn", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/impact")) {
-        return runAlias(allocator, &request, &meta, ws, "blast_radius", target, null);
+        return runAlias(allocator, request, meta, ws, "blast_radius", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/plan")) {
-        return runAlias(allocator, &request, &meta, ws, "plan_goal", target, null);
+        return runAlias(allocator, request, meta, ws, "plan_goal", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/route")) {
-        return runAlias(allocator, &request, &meta, ws, "route_query", target, null);
+        return runAlias(allocator, request, meta, ws, "route_query", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/dispute")) {
-        return runAlias(allocator, &request, &meta, ws, "find_contradictions", target, null);
+        return runAlias(allocator, request, meta, ws, "find_contradictions", target, null);
     }
     if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) {
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -466,7 +791,7 @@ fn handleConn(
             if (obj.get("reason")) |r| r.string else "manual",
         );
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/graph")) {
@@ -484,22 +809,22 @@ fn handleConn(
         try parseQuery(allocator, query, &params);
         const json = try ws.graphJson(allocator, params.get("run_id") orelse "");
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/embed")) {
-        return runAlias(allocator, &request, &meta, ws, "embed_recall", target, null);
+        return runAlias(allocator, request, meta, ws, "embed_recall", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/diff")) {
-        return runAlias(allocator, &request, &meta, ws, "diff_run", target, null);
+        return runAlias(allocator, request, meta, ws, "diff_run", target, null);
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/consolidate")) {
-        return runAlias(allocator, &request, &meta, ws, "consolidate_claims", target, null);
+        return runAlias(allocator, request, meta, ws, "consolidate_claims", target, null);
     }
     if (method == .POST and std.mem.eql(u8, path, "/v1/checkpoint")) {
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -511,30 +836,30 @@ fn handleConn(
         const name = obj.get("name").?.string;
         const ds = if (obj.get("datasource")) |d| d.string else "harness_events";
         if (!safe_name.isSafeName(name)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_checkpoint_name\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_checkpoint_name\"}\n", .bad_request, "application/json");
             return;
         }
         const json = ws.checkpoint(name, ds) catch |err| switch (err) {
             error.InvalidCheckpointName, error.InvalidDatasourceName => {
-                try respond(&request, &meta, "{\"error\":\"invalid_checkpoint_name\"}\n", .bad_request, "application/json");
+                try respond(request, meta, "{\"error\":\"invalid_checkpoint_name\"}\n", .bad_request, "application/json");
                 return;
             },
             else => |e| return e,
         };
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .POST and std.mem.eql(u8, path, "/v1/reload")) {
         try ws.reloadPipes();
-        try respond(&request, &meta, "{\"reloaded\":true}\n", .ok, "application/json");
+        try respond(request, meta, "{\"reloaded\":true}\n", .ok, "application/json");
         return;
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) {
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -542,44 +867,44 @@ fn handleConn(
         defer allocator.free(body);
         const resp = try mcp_mod.handle(allocator, ws, body);
         defer allocator.free(resp);
-        try respond(&request, &meta, resp, .ok, "application/json");
+        try respond(request, meta, resp, .ok, "application/json");
         return;
     }
 
-    // --- Durable workflows (Temporal / Inngest-shaped) ---
+    // --- Durable workflows ---
     if (method == .GET and std.mem.eql(u8, path, "/v1/workflows")) {
         const json = try ws.workflowList();
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .POST and std.mem.eql(u8, path, "/v1/workflows/tick")) {
         const json = try ws.workflowTick();
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .GET and std.mem.startsWith(u8, path, "/v1/workflows/") and !std.mem.eql(u8, path, "/v1/workflows/tick")) {
         const name = path["/v1/workflows/".len..];
         if (std.mem.indexOfScalar(u8, name, '/') == null and safe_name.isSafeName(name)) {
             const json = ws.workflowShow(name) catch {
-                try respond(&request, &meta, "{\"error\":\"workflow_not_found\"}\n", .not_found, "application/json");
+                try respond(request, meta, "{\"error\":\"workflow_not_found\"}\n", .not_found, "application/json");
                 return;
             };
             defer allocator.free(json);
-            try respond(&request, &meta, json, .ok, "application/json");
+            try respond(request, meta, json, .ok, "application/json");
             return;
         }
     }
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflows/") and std.mem.endsWith(u8, path, "/runs")) {
         const mid = path["/v1/workflows/".len .. path.len - "/runs".len];
         if (!safe_name.isSafeName(mid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_workflow_name\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_workflow_name\"}\n", .bad_request, "application/json");
             return;
         }
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -609,42 +934,42 @@ fn handleConn(
             }
         }
         const json = ws.workflowStart(mid, input, run_id) catch {
-            try respond(&request, &meta, "{\"error\":\"workflow_start_failed\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"workflow_start_failed\"}\n", .bad_request, "application/json");
             return;
         };
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/workflow-runs")) {
         const json = try ws.workflowListRuns();
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .GET and std.mem.startsWith(u8, path, "/v1/workflow-runs/")) {
         const rid = path["/v1/workflow-runs/".len..];
         if (!safe_name.isSafeName(rid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
             return;
         }
         const json = ws.workflowStatus(rid) catch {
-            try respond(&request, &meta, "{\"error\":\"run_not_found\"}\n", .not_found, "application/json");
+            try respond(request, meta, "{\"error\":\"run_not_found\"}\n", .not_found, "application/json");
             return;
         };
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/signal")) {
         const rid = path["/v1/workflow-runs/".len .. path.len - "/signal".len];
         if (!safe_name.isSafeName(rid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
             return;
         }
-        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+        const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
-                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
                 return;
             },
             else => |e| return e,
@@ -653,7 +978,7 @@ fn handleConn(
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
         const typ_raw = parsed.value.object.get("type") orelse {
-            try respond(&request, &meta, "{\"error\":\"missing_type\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"missing_type\"}\n", .bad_request, "application/json");
             return;
         };
         const typ = try allocator.dupe(u8, typ_raw.string);
@@ -671,38 +996,40 @@ fn handleConn(
             break :blk "{}";
         };
         const json = ws.workflowSignal(rid, typ, payload) catch {
-            try respond(&request, &meta, "{\"error\":\"signal_failed\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"signal_failed\"}\n", .bad_request, "application/json");
             return;
         };
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/cancel")) {
         const rid = path["/v1/workflow-runs/".len .. path.len - "/cancel".len];
         if (!safe_name.isSafeName(rid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
             return;
         }
         const json = try ws.workflowCancel(rid);
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
     if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/tick")) {
         const rid = path["/v1/workflow-runs/".len .. path.len - "/tick".len];
         if (!safe_name.isSafeName(rid)) {
-            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            try respond(request, meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
             return;
         }
         const json = try ws.workflowTickRun(rid);
         defer allocator.free(json);
-        try respond(&request, &meta, json, .ok, "application/json");
+        try respond(request, meta, json, .ok, "application/json");
         return;
     }
 
-    try respond(&request, &meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
+    try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
 }
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn pathOnlyStr(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];

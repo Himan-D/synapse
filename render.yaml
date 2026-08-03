@@ -1,0 +1,40 @@
+version: "1"
+
+# ── Synapse Cloud — Render Blueprint ─────────────────────────────────────────
+# Deploy: https://dashboard.render.com/select-repo → "Apply Blueprint"
+# Docs:   docs/CLOUD.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: synapse
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # upgrade to standard/pro for production SLOs
+
+    # Render injects $PORT automatically; Synapse reads it at startup.
+    # The service must bind 0.0.0.0:$PORT — the Dockerfile sets SYNAPSE_HOST=0.0.0.0.
+    healthCheckPath: /health
+
+    envVars:
+      # ── Required ──────────────────────────────────────────────────────────
+      - key: SYNAPSE_REQUIRE_AUTH
+        value: "1"               # never run unauthenticated on 0.0.0.0
+      - key: SYNAPSE_DATA_ROOT
+        value: /data             # must match disk.mountPath below
+
+      # ── Optional ──────────────────────────────────────────────────────────
+      # Uncomment and set to enable per-token request-rate limiting (req/s).
+      # - key: SYNAPSE_RATE_LIMIT
+      #   value: "100"
+
+      # Host is fixed to 0.0.0.0 in the image; override here only if needed.
+      # - key: SYNAPSE_HOST
+      #   value: "0.0.0.0"
+
+    # Persistent disk for workspace data, platform catalog, and event NDJSON.
+    # Data survives redeploys and restarts.  Minimum 1 GiB on Render free tier.
+    disk:
+      name: synapse-data
+      mountPath: /data
+      sizeGB: 10
