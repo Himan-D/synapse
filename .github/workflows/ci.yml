@@ -89,4 +89,4 @@ jobs:
 
       - name: Dump container logs on failure
         if: failure()
-        run: docker logs synapse-ci
+        run: docker logs synapse-ci 2>/dev/null || echo "(no container logs)"

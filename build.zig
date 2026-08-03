@@ -39,6 +39,8 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // std.c.getenv / posix need libc on Linux (macOS links it by default).
+        .link_libc = true,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -70,6 +72,7 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
