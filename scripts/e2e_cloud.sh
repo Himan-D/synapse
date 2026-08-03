@@ -574,4 +574,74 @@ assert_code "env-var workspace token rejected when flag wins" "403" "$code"
 stop_pid "$FLAGWS_PID"
 FLAGWS_PID=""
 
+# ── Token expiry ──────────────────────────────────────────────────────────────
+
+echo "==> mint token with ttl_seconds"
+TTL_OUT=$(curl -sf -X POST "http://127.0.0.1:8790/v1/platform/tokens" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "content-type: application/json" \
+    -d "{\"workspace_id\":\"$WS_A\",\"name\":\"short-lived\",\"scope\":\"ADMIN\",\"ttl_seconds\":30}")
+echo "$TTL_OUT"
+assert_contains "ttl mint includes expires_at" '"expires_at":' "$TTL_OUT"
+TTL_TOK=$(echo "$TTL_OUT" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+test -n "$TTL_TOK" || { echo "FAIL: no ttl token"; exit 1; }
+
+echo "==> ttl token works immediately"
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TTL_TOK" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "ttl token before expiry" "200" "$code"
+
+echo "==> wait for token expiry"
+sleep 31
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TTL_TOK" \
+    "http://127.0.0.1:8790/v1/w/$WS_A/workspace")
+assert_code "expired token rejected" "401" "$code"
+
+echo "==> token list shows expires_at"
+LIST_TOKENS=$(curl -sf "http://127.0.0.1:8790/v1/platform/tokens?workspace_id=$WS_A" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+assert_contains "token list has expires_at" '"expires_at":' "$LIST_TOKENS"
+
+# ── Platform audit log ────────────────────────────────────────────────────────
+
+echo "==> audit log records control-plane actions"
+AUDIT=$(curl -sf "http://127.0.0.1:8790/v1/platform/audit" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+echo "$AUDIT"
+assert_contains "audit has token_mint" 'token_mint' "$AUDIT"
+assert_contains "audit has token_revoke" 'token_revoke' "$AUDIT"
+if echo "$AUDIT" | grep -qE '"(token|admin_token)":'; then
+    echo "FAIL: audit log leaked a raw secret"
+    exit 1
+fi
+echo "ok   [audit redacts secrets]"
+
+# ── Soft quotas (429 on ingest + requests) ───────────────────────────────────
+
+echo "==> restart server with soft quotas"
+stop_pid "$SERVER_PID"
+SERVER_PID=""
+SYNAPSE_REQUIRE_AUTH=1 \
+    SYNAPSE_QUOTA_INGEST_EVENTS=5 \
+    SYNAPSE_QUOTA_REQUESTS=10 \
+    "$BIN" cloud serve --data-root "$DATA" --host 127.0.0.1 --port 8790 &
+SERVER_PID=$!
+sleep 0.6
+
+echo "==> ingest until quota exceeded -> 429"
+for i in 1 2 3 4 5 6; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "http://127.0.0.1:8790/v1/w/$WS_B/events/harness_events" \
+        -H "Authorization: Bearer $TOK_B" \
+        -H "content-type: application/x-ndjson" \
+        --data-binary "{\"ts\":\"2026-01-01T00:00:00Z\",\"run_id\":\"quota_test_$i\",\"agent_id\":\"agent_q\",\"type\":\"plan_step\",\"payload\":{\"task_id\":\"t$i\",\"name\":\"n$i\"}}")
+    if [ "$i" -le 5 ]; then
+        assert_code "ingest $i within quota" "200" "$code"
+    else
+        assert_code "ingest over quota" "429" "$code"
+    fi
+done
+
 echo "==> e2e_cloud OK"

@@ -11,12 +11,15 @@ const safe_name = @import("../core/safe_name.zig");
 const ratelimit_mod = @import("../core/ratelimit.zig");
 const auth_mod = @import("../core/auth.zig");
 const usage_mod = @import("../core/usage.zig");
+const quota_mod = @import("../core/quota.zig");
+const audit_mod = @import("../core/audit.zig");
 
 /// Where to attribute per-workspace usage for the request being served.
 /// Absent in single-workspace dev mode, which is not metered.
 const UsageRecorder = struct {
     store: *usage_mod.UsageStore,
     workspace_id: []const u8,
+    quota: quota_mod.Policy = .{},
 };
 
 pub const max_body_bytes: usize = 16 * 1024 * 1024;
@@ -550,8 +553,18 @@ fn handleConnCloud(
             }
         }
 
+        const quota = quota_mod.Policy.fromEnv();
+        if (!quota.checkRequest(&hub.usage, workspace_id)) {
+            try respond(&request, &meta, "{\"error\":\"quota_exceeded\",\"dimension\":\"requests\"}\n", .too_many_requests, "application/json");
+            return;
+        }
+
         hub.usage.recordRequest(workspace_id);
-        const recorder: UsageRecorder = .{ .store = &hub.usage, .workspace_id = workspace_id };
+        const recorder: UsageRecorder = .{
+            .store = &hub.usage,
+            .workspace_id = workspace_id,
+            .quota = quota_mod.Policy.fromEnv(),
+        };
         try routeWorkspace(allocator, io, ws, &request, &meta, rewritten_path, rewritten_target, max_body, recorder);
         return;
     }
@@ -593,8 +606,17 @@ fn handleConnCloud(
                 },
             }
         }
+        const quota = quota_mod.Policy.fromEnv();
+        if (!quota.checkRequest(&hub.usage, def_ws)) {
+            try respond(&request, &meta, "{\"error\":\"quota_exceeded\",\"dimension\":\"requests\"}\n", .too_many_requests, "application/json");
+            return;
+        }
         hub.usage.recordRequest(def_ws);
-        const recorder: UsageRecorder = .{ .store = &hub.usage, .workspace_id = def_ws };
+        const recorder: UsageRecorder = .{
+            .store = &hub.usage,
+            .workspace_id = def_ws,
+            .quota = quota_mod.Policy.fromEnv(),
+        };
         try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body, recorder);
         return;
     }
@@ -616,6 +638,16 @@ fn platformControlPlane(
     target: []const u8,
     max_body: usize,
 ) !void {
+    // GET /v1/platform/audit — recent control-plane events.
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/audit")) {
+        const limit_s = queryParam(target, "limit") orelse "100";
+        const limit = std.fmt.parseInt(usize, limit_s, 10) catch 100;
+        const json = try hub.audit.toJson(allocator, limit);
+        defer allocator.free(json);
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
+
     // GET /v1/platform/usage — per-workspace counters for billing.
     if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/usage")) {
         const json = try hub.usage.toJson(allocator);
@@ -653,6 +685,7 @@ fn platformControlPlane(
             else => |e| return e,
         };
         defer allocator.free(json);
+        hub.audit.record("org_create", "admin", try redactSecrets(allocator, json));
         try respond(request, meta, json, .ok, "application/json");
         return;
     }
@@ -699,6 +732,7 @@ fn platformControlPlane(
         hub.scaffoldWorkspace(ws_id, name) catch |err| {
             std.log.warn("workspace scaffold failed for {s}: {s}", .{ ws_id, @errorName(err) });
         };
+        hub.audit.record("workspace_create", "admin", try redactSecrets(allocator, json));
         try respond(request, meta, json, .ok, "application/json");
         return;
     }
@@ -737,7 +771,18 @@ fn platformControlPlane(
         const workspace_id = obj.get("workspace_id").?.string;
         const name = if (obj.get("name")) |v| v.string else "api";
         const scope = if (obj.get("scope")) |v| v.string else "ADMIN";
-        const json = hub.platform.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+        const ttl: ?i64 = blk: {
+            if (obj.get("ttl_seconds")) |v| switch (v) {
+                .integer => |i| break :blk i,
+                else => break :blk null,
+            };
+            if (obj.get("expires_in")) |v| switch (v) {
+                .integer => |i| break :blk i,
+                else => break :blk null,
+            };
+            break :blk null;
+        };
+        const json = hub.platform.mintToken(workspace_id, name, scope, ttl) catch |err| switch (err) {
             error.WorkspaceNotFound => {
                 try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .bad_request, "application/json");
                 return;
@@ -749,6 +794,7 @@ fn platformControlPlane(
             else => |e| return e,
         };
         defer allocator.free(json);
+        hub.audit.record("token_mint", "admin", try redactSecrets(allocator, json));
         try respond(request, meta, json, .ok, "application/json");
         return;
     }
@@ -880,7 +926,18 @@ fn platformControlPlane(
                     const obj = parsed.value.object;
                     const name = if (obj.get("name")) |v| v.string else "api";
                     const scope = if (obj.get("scope")) |v| v.string else "ADMIN";
-                    const json = hub.platform.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+                    const ttl: ?i64 = blk: {
+                        if (obj.get("ttl_seconds")) |v| switch (v) {
+                            .integer => |i| break :blk i,
+                            else => break :blk null,
+                        };
+                        if (obj.get("expires_in")) |v| switch (v) {
+                            .integer => |i| break :blk i,
+                            else => break :blk null,
+                        };
+                        break :blk null;
+                    };
+                    const json = hub.platform.mintToken(workspace_id, name, scope, ttl) catch |err| switch (err) {
                         error.WorkspaceNotFound => {
                             try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
                             return;
@@ -892,6 +949,7 @@ fn platformControlPlane(
                         else => |e| return e,
                     };
                     defer allocator.free(json);
+                    hub.audit.record("token_mint", "admin", try redactSecrets(allocator, json));
                     try respond(request, meta, json, .ok, "application/json");
                     return;
                 }
@@ -921,6 +979,7 @@ fn revokeTokenRoute(
         else => |e| return e,
     };
     defer allocator.free(json);
+    hub.audit.record("token_revoke", "admin", try redactSecrets(allocator, json));
     try respond(request, meta, json, .ok, "application/json");
 }
 
@@ -965,6 +1024,12 @@ fn routeWorkspace(
         if (!safe_name.isSafeName(ds)) {
             try respond(request, meta, "{\"error\":\"invalid_datasource\"}\n", .bad_request, "application/json");
             return;
+        }
+        if (usage) |u| {
+            if (!u.quota.checkIngest(u.store, u.workspace_id)) {
+                try respond(request, meta, "{\"error\":\"quota_exceeded\",\"dimension\":\"ingest_events\"}\n", .too_many_requests, "application/json");
+                return;
+            }
         }
         const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {
@@ -1516,6 +1581,21 @@ fn parseQuery(allocator: Allocator, query: []const u8, params: *std.StringHashMa
         const val = try allocator.dupe(u8, val_buf.items);
         try params.put(allocator, key, val);
     }
+}
+
+fn redactSecrets(allocator: Allocator, json: []const u8) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
+        return try allocator.dupe(u8, json);
+    };
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        _ = parsed.value.object.swapRemove("token");
+        _ = parsed.value.object.swapRemove("admin_token");
+    }
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, &aw.writer);
+    return try aw.toOwnedSlice();
 }
 
 fn readBody(allocator: Allocator, request: *std.http.Server.Request, max_body: usize) ![]u8 {

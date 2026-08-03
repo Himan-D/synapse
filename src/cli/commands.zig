@@ -448,7 +448,9 @@ fn runPlatformToken(allocator: Allocator, io: Io, args: []const []const u8, sub:
     if (std.mem.eql(u8, sub, "create")) {
         const name = if (args.len >= 4) args[3] else "api";
         const scope = flagOr(args, "--scope", "ADMIN");
-        const json = store.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+        const ttl_s = flagOr(args, "--ttl", "");
+        const ttl: ?i64 = if (ttl_s.len > 0) std.fmt.parseInt(i64, ttl_s, 10) catch null else null;
+        const json = store.mintToken(workspace_id, name, scope, ttl) catch |err| switch (err) {
             error.WorkspaceNotFound => {
                 std.log.err("workspace '{s}' not found in platform store", .{workspace_id});
                 return error.WorkspaceNotFound;
@@ -612,7 +614,7 @@ fn runCloud(allocator: Allocator, io: Io, args: []const []const u8) !void {
 
 fn runOps(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (args.len < 3) {
-        std.debug.print("Usage: synapse ops <init|mcp|status> --root <dir>\n", .{});
+        std.debug.print("Usage: synapse ops <init|mcp|status|watch> --root <dir>\n", .{});
         return error.Usage;
     }
     const sub = args[2];
@@ -626,19 +628,29 @@ fn runOps(allocator: Allocator, io: Io, args: []const []const u8) !void {
             std.log.info("created workspace at {s}", .{root});
         };
         const base_url = flagOr(args, "--base-url", "http://127.0.0.1:8787");
-        try workspace_mod.writeOpsConfig(allocator, io, root, base_url);
-        std.log.info("wrote .synapse/ops.json and .synapse/ops.CURSOR.md", .{});
+        const synapse_bin = blk: {
+            if (std.c.getenv("SYNAPSE_BIN")) |v| break :blk std.mem.span(v);
+            if (args.len > 0) break :blk args[0];
+            break :blk "synapse";
+        };
+        try workspace_mod.writeOpsConfig(allocator, io, root, base_url, synapse_bin);
+        std.log.info("wrote .synapse/ops.json, .cursor/hooks.json, .synapse/ops.mcp.json", .{});
         var steps_buf: [1024]u8 = undefined;
         const steps = try std.fmt.bufPrint(&steps_buf,
+            \\Automatic ops capture wired:
+            \\  .synapse/ops.json       (enabled)
+            \\  .cursor/hooks.json      (afterToolUse hook)
+            \\  .synapse/ops.mcp.json   (MCP snippet — merge into Cursor settings)
+            \\
             \\Next steps:
             \\  1. synapse dev --root {s} --port 8787
-            \\  2. Point Cursor MCP at: synapse ops mcp --root {s}
-            \\     (set SYNAPSE_AGENT_ID / SYNAPSE_RUN_ID in MCP env)
-            \\  3. Or wire afterToolUse hooks — see examples/ops/cursor-hooks.example.json
-            \\  4. synapse ops status --root {s}
-            \\  5. curl '{s}/v1/ops/activity?limit=20'
+            \\  2. Merge .synapse/ops.mcp.json into Cursor MCP settings
+            \\     (or: synapse ops mcp --root {s} with SYNAPSE_AGENT_ID / SYNAPSE_RUN_ID)
+            \\  3. synapse ops status --root {s}
+            \\  4. curl '{s}/v1/ops/activity?limit=20'
+            \\  5. Optional: synapse ops watch --root {s}  (transcript tail)
             \\
-        , .{ root, root, root, base_url });
+        , .{ root, root, root, base_url, root });
         try printStdoutLine(io, steps);
         return;
     }
@@ -653,20 +665,82 @@ fn runOps(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (std.mem.eql(u8, sub, "status")) {
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const ops_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.json", .{root});
-        const ops_exists = blk: {
-            Io.Dir.cwd().access(io, ops_path, .{}) catch break :blk false;
-            break :blk true;
-        };
+        const ops_exists = workspace_mod.pathExists(io, ops_path);
+        const hooks_path = try std.fmt.bufPrint(&path_buf, "{s}/.cursor/hooks.json", .{root});
+        const hooks_installed = workspace_mod.pathExists(io, hooks_path);
+        const mcp_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.mcp.json", .{root});
+        const mcp_present = workspace_mod.pathExists(io, mcp_path);
         var ws = try workspace_mod.Workspace.load(allocator, io, root);
         defer ws.deinit();
-        const json = try ws.opsStatusJson(allocator, ops_exists);
+        const json = try ws.opsStatusJson(allocator, .{
+            .ops_config_exists = ops_exists,
+            .hooks_installed = hooks_installed,
+            .mcp_config_present = mcp_present,
+            .watching = false,
+        });
         defer allocator.free(json);
         try printStdoutLine(io, json);
         return;
     }
 
+    if (std.mem.eql(u8, sub, "watch")) {
+        try runOpsWatch(allocator, io, root, args);
+        return;
+    }
+
     std.log.err("unknown ops sub-command: {s}", .{sub});
     return error.Usage;
+}
+
+/// Opt-in transcript scan: reads SYNAPSE_TRANSCRIPT_DIR or skips gracefully.
+fn runOpsWatch(allocator: Allocator, io: Io, root: []const u8, args: []const []const u8) !void {
+    const follow = hasFlag(args, "--follow");
+    var ws = try workspace_mod.Workspace.load(allocator, io, root);
+    defer ws.deinit();
+
+    const transcript_dir: ?[]const u8 = blk: {
+        if (std.c.getenv("SYNAPSE_TRANSCRIPT_DIR")) |v| break :blk try allocator.dupe(u8, std.mem.span(v));
+        if (std.c.getenv("HOME")) |home| {
+            const guess = try std.fmt.allocPrint(allocator, "{s}/.cursor/projects", .{std.mem.span(home)});
+            defer allocator.free(guess);
+            if (workspace_mod.pathExists(io, guess)) break :blk try allocator.dupe(u8, guess);
+        }
+        break :blk null;
+    };
+    defer if (transcript_dir) |d| allocator.free(d);
+
+    if (transcript_dir == null) {
+        std.log.info("no transcript dir found — set SYNAPSE_TRANSCRIPT_DIR to enable watch", .{});
+        try printStdoutLine(io, "{\"watching\":false,\"reason\":\"no_transcript_dir\"}");
+        return;
+    }
+
+    const run_id = envOrDefault("SYNAPSE_RUN_ID", "run_ops");
+    const agent_id = envOrDefault("SYNAPSE_AGENT_ID", "cursor");
+    var count: u32 = 0;
+
+    while (true) {
+        if (Io.Dir.cwd().openDir(io, transcript_dir.?, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+                ws.recordOpsToolCall(run_id, agent_id, "transcript_seen", true, 0) catch {};
+                count += 1;
+            }
+        } else |_| {}
+        if (!follow) break;
+        try Io.sleep(io, .fromMilliseconds(2000), .real);
+    }
+
+    var out_buf: [128]u8 = undefined;
+    const out = try std.fmt.bufPrint(&out_buf, "{{\"watching\":false,\"transcripts\":{d},\"dir\":{f}}}", .{
+        count,
+        std.json.fmt(transcript_dir.?, .{}),
+    });
+    try printStdoutLine(io, out);
 }
 
 fn envOrDefault(comptime key: [:0]const u8, default: []const u8) []const u8 {
@@ -1016,7 +1090,7 @@ fn printHelp() !void {
         \\  synapse graph --root <dir> --run-id <id>
         \\  synapse deploy --root <dir>
         \\  synapse mcp --root <dir>
-        \\  synapse ops init|mcp|status --root <dir>
+        \\  synapse ops init|mcp|status|watch --root <dir>
         \\  synapse dev --root <dir> --port <port> [--host 127.0.0.1]
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]

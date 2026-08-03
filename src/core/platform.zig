@@ -37,6 +37,8 @@ pub const PlatformToken = struct {
     workspace_id: []const u8,
     scopes: []const auth_mod.Scope,
     created_at: i64 = 0,
+    /// Unix seconds; null = no expiry.
+    expires_at: ?i64 = null,
     revoked: bool = false,
 };
 
@@ -209,6 +211,7 @@ pub const PlatformStore = struct {
                     .workspace_id = try self.allocator.dupe(u8, jsonString(t, "workspace_id") orelse ""),
                     .scopes = try scopes.toOwnedSlice(self.allocator),
                     .created_at = jsonInt(t, "created_at") orelse 0,
+                    .expires_at = jsonInt(t, "expires_at"),
                     .revoked = jsonBool(t, "revoked") orelse false,
                 });
             }
@@ -255,7 +258,7 @@ pub const PlatformStore = struct {
             if (i > 0) try aw.writer.writeAll(",");
             try aw.writer.print(
                 "{{\"id\":{f},\"name\":{f},\"token_hash\":{f},\"org_id\":{f},\"workspace_id\":{f}," ++
-                    "\"created_at\":{d},\"revoked\":{s},\"scopes\":[",
+                    "\"created_at\":{d},\"expires_at\":",
                 .{
                     std.json.fmt(t.id, .{}),
                     std.json.fmt(t.name, .{}),
@@ -263,9 +266,13 @@ pub const PlatformStore = struct {
                     std.json.fmt(t.org_id, .{}),
                     std.json.fmt(t.workspace_id, .{}),
                     t.created_at,
-                    if (t.revoked) "true" else "false",
                 },
             );
+            if (t.expires_at) |exp| {
+                try aw.writer.print("{d},\"revoked\":{s},\"scopes\":[", .{ exp, if (t.revoked) "true" else "false" });
+            } else {
+                try aw.writer.print("null,\"revoked\":{s},\"scopes\":[", .{if (t.revoked) "true" else "false"});
+            }
             for (t.scopes, 0..) |s, si| {
                 if (si > 0) try aw.writer.writeAll(",");
                 try aw.writer.print("{f}", .{std.json.fmt(s.toWire(), .{})});
@@ -442,7 +449,8 @@ pub const PlatformStore = struct {
 
     /// Mint a workspace token. The returned JSON carries the raw secret; this is
     /// the only time it exists outside the caller's memory.
-    pub fn mintToken(self: *PlatformStore, workspace_id: []const u8, name: []const u8, scope_str: []const u8) ![]u8 {
+    /// Pass ttl_seconds > 0 to set expires_at = now + ttl.
+    pub fn mintToken(self: *PlatformStore, workspace_id: []const u8, name: []const u8, scope_str: []const u8, ttl_seconds: ?i64) ![]u8 {
         if (self.findWorkspace(workspace_id) == null) return error.WorkspaceNotFound;
         const scope = auth_mod.Scope.fromString(scope_str) orelse return error.UnknownScope;
         var tok_buf: [40]u8 = undefined;
@@ -452,6 +460,10 @@ pub const PlatformStore = struct {
         var id_buf: [32]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "tok_{s}", .{shortId(self.io)});
         const created_at = nowSeconds(self.io);
+        const expires_at: ?i64 = if (ttl_seconds) |ttl| blk: {
+            if (ttl <= 0) break :blk null;
+            break :blk created_at + ttl;
+        } else null;
 
         const org_id_owned: []const u8 = blk: {
             for (self.workspaces.items) |w| {
@@ -468,11 +480,14 @@ pub const PlatformStore = struct {
             .workspace_id = try self.allocator.dupe(u8, workspace_id),
             .scopes = scopes,
             .created_at = created_at,
+            .expires_at = expires_at,
             .revoked = false,
         });
         try self.save();
-        return try std.fmt.allocPrint(self.allocator,
-            \\{{"created":true,"id":{f},"name":{f},"token":{f},"workspace_id":{f},"scopes":[{f}],"created_at":{d},"hint":"store this token now; only its SHA-256 digest is kept"}}
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        try aw.writer.print(
+            \\{{"created":true,"id":{f},"name":{f},"token":{f},"workspace_id":{f},"scopes":[{f}],"created_at":{d},"expires_at":
         , .{
             std.json.fmt(id, .{}),
             std.json.fmt(name, .{}),
@@ -481,6 +496,13 @@ pub const PlatformStore = struct {
             std.json.fmt(scope.toWire(), .{}),
             created_at,
         });
+        if (expires_at) |exp| {
+            try aw.writer.print("{d}", .{exp});
+        } else {
+            try aw.writer.writeAll("null");
+        }
+        try aw.writer.writeAll(",\"hint\":\"store this token now; only its SHA-256 digest is kept\"}");
+        return try aw.toOwnedSlice();
     }
 
     pub fn findTokenById(self: *const PlatformStore, id: []const u8) ?PlatformToken {
@@ -520,16 +542,20 @@ pub const PlatformStore = struct {
             if (!first) try aw.writer.writeAll(",");
             first = false;
             try aw.writer.print(
-                "{{\"id\":{f},\"name\":{f},\"org_id\":{f},\"workspace_id\":{f},\"created_at\":{d},\"revoked\":{s},\"scopes\":[",
+                "{{\"id\":{f},\"name\":{f},\"org_id\":{f},\"workspace_id\":{f},\"created_at\":{d},\"expires_at\":",
                 .{
                     std.json.fmt(t.id, .{}),
                     std.json.fmt(t.name, .{}),
                     std.json.fmt(t.org_id, .{}),
                     std.json.fmt(t.workspace_id, .{}),
                     t.created_at,
-                    if (t.revoked) "true" else "false",
                 },
             );
+            if (t.expires_at) |exp| {
+                try aw.writer.print("{d},\"revoked\":{s},\"scopes\":[", .{ exp, if (t.revoked) "true" else "false" });
+            } else {
+                try aw.writer.print("null,\"revoked\":{s},\"scopes\":[", .{if (t.revoked) "true" else "false"});
+            }
             for (t.scopes, 0..) |s, si| {
                 if (si > 0) try aw.writer.writeAll(",");
                 try aw.writer.print("{f}", .{std.json.fmt(s.toWire(), .{})});
@@ -543,11 +569,13 @@ pub const PlatformStore = struct {
     // ── Auth helpers ────────────────────────────────────────────────────────
 
     /// Return the workspace_id that `token` is scoped to, or null.
-    /// Revoked tokens resolve to null.
+    /// Revoked or expired tokens resolve to null.
     pub fn resolveWorkspaceId(self: *const PlatformStore, token: []const u8) ?[]const u8 {
         const presented = hashTokenHex(token);
+        const now = nowSeconds(self.io);
         for (self.tokens.items) |t| {
             if (t.revoked) continue;
+            if (tokenExpired(t, now)) continue;
             if (hashEql(t.token_hash, &presented)) return t.workspace_id;
         }
         return null;
@@ -569,12 +597,19 @@ pub const PlatformStore = struct {
     ) bool {
         if (self.isAdminToken(token)) return true;
         const presented = hashTokenHex(token);
+        const now = nowSeconds(self.io);
         for (self.tokens.items) |t| {
             if (t.revoked) continue;
+            if (tokenExpired(t, now)) continue;
             if (!hashEql(t.token_hash, &presented)) continue;
             if (!std.mem.eql(u8, t.workspace_id, workspace_id)) return false; // wrong workspace
             return tokenHasScope(t.scopes, need);
         }
+        return false;
+    }
+
+    fn tokenExpired(t: PlatformToken, now: i64) bool {
+        if (t.expires_at) |exp| return now >= exp;
         return false;
     }
 
@@ -750,8 +785,8 @@ test "mintToken rejects unknown scope" {
         .org_id = try gpa.dupe(u8, "org_1"),
     });
 
-    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "INVALID_SCOPE"));
-    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "MIND:READ"));
+    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "INVALID_SCOPE", null));
+    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "MIND:READ", null));
 }
 
 test "mint → authorize → revoke → reject, with no raw secret on disk" {
@@ -785,7 +820,7 @@ test "mint → authorize → revoke → reject, with no raw secret on disk" {
     const ws_id = try gpa.dupe(u8, ws_parsed.value.object.get("workspace_id").?.string);
     defer gpa.free(ws_id);
 
-    const mint_json = try store.mintToken(ws_id, "writer", "ADMIN");
+    const mint_json = try store.mintToken(ws_id, "writer", "ADMIN", null);
     defer gpa.free(mint_json);
     var mint_parsed = try std.json.parseFromSlice(std.json.Value, gpa, mint_json, .{});
     defer mint_parsed.deinit();

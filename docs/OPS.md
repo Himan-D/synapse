@@ -1,6 +1,6 @@
 # Ops capture — who did what
 
-Synapse **ops** is drop-in agent activity logging for any repo. It records events you explicitly wire in via MCP, IDE hooks, or SDK decorators — **not** silent IDE surveillance.
+Synapse **ops** is drop-in agent activity logging for any repo. After `synapse ops init`, capture wiring is written automatically — hooks, MCP config, and status are always visible in the repo.
 
 ## Honest limits
 
@@ -13,6 +13,8 @@ Synapse **ops** is drop-in agent activity logging for any repo. It records event
 
 Events land in the `harness_events` datasource (`tool_call`, `error`, `llm_span`, `plan_step`).
 
+**Not spyware** — nothing is hidden. All wiring lives in `.synapse/ops.json`, `.cursor/hooks.json`, and `.synapse/ops.mcp.json`. Check anytime with `synapse ops status`.
+
 ## Install in any repo (< 2 min)
 
 ```bash
@@ -21,7 +23,14 @@ Events land in the `harness_events` datasource (`tool_call`, `error`, `llm_span`
 /path/to/synapse dev --root . --port 8787
 ```
 
-This creates (or reuses) a Synapse workspace, writes `.synapse/ops.json`, and `.synapse/ops.CURSOR.md` with hook hints.
+This creates (or reuses) a Synapse workspace and writes:
+
+| File | Purpose |
+|---|---|
+| `.synapse/ops.json` | Capture config (`enabled: true`) |
+| `.cursor/hooks.json` | Cursor afterToolUse hook |
+| `.synapse/ops.mcp.json` | MCP server snippet for Cursor |
+| `.synapse/ops.CURSOR.md` | Setup notes |
 
 Set identity for multi-agent setups:
 
@@ -34,7 +43,7 @@ export SYNAPSE_RUN_ID=my-feature-branch
 
 ### 1. MCP (recommended)
 
-Point Cursor MCP at the ops-aware stdio server:
+Merge `.synapse/ops.mcp.json` into Cursor MCP settings, or point at:
 
 ```json
 {
@@ -55,8 +64,8 @@ Same tools as `synapse mcp`, plus automatic `tool_call` ingest on every `tools/c
 
 ### 2. Cursor / IDE hooks
 
-See [examples/ops/cursor-hooks.example.json](../examples/ops/cursor-hooks.example.json).  
-POST NDJSON lines to `POST /v1/events/harness_events` after each tool use.
+Written automatically to `.cursor/hooks.json` by `ops init`.  
+See also [examples/ops/cursor-hooks.example.json](../examples/ops/cursor-hooks.example.json).
 
 ### 3. Python decorator
 
@@ -83,13 +92,15 @@ const grep = s.wrapTool("grep", (q: string) => `hits for ${q}`, {
 });
 ```
 
-Or batch ingest:
+## Optional transcript watch
 
-```typescript
-await s.ingest("harness_events", [
-  { ts: "...", run_id: "run_1", agent_id: "a1", type: "tool_call", payload: { name: "grep", ok: true } },
-]);
+```bash
+synapse ops watch --root .              # one scan
+synapse ops watch --root . --follow     # poll SYNAPSE_TRANSCRIPT_DIR
+export SYNAPSE_TRANSCRIPT_DIR=~/.cursor/projects/my-project/agent-transcripts
 ```
+
+Gracefully skips if no transcript directory is found.
 
 ## Query activity
 
@@ -99,7 +110,9 @@ curl 'http://127.0.0.1:8787/v1/ops/activity?limit=20'
 curl 'http://127.0.0.1:8787/v1/ops/activity?agent_id=cursor&run_id=my-run'
 ```
 
-Response shape:
+Status includes: `ops_config`, `capture_enabled`, `hooks_installed`, `mcp_config_present`, `last_event_ts`, per-agent counts.
+
+Response shape for activity:
 
 ```json
 {
@@ -109,13 +122,6 @@ Response shape:
 ```
 
 Auth: same as other reads — `QUERY:READ` (or `PIPES:READ` / `ADMIN`) when `SYNAPSE_REQUIRE_AUTH=1`.
-
-## Files written by `ops init`
-
-| File | Purpose |
-|---|---|
-| `.synapse/ops.json` | Version, datasource, base_url, capture list, identity env keys |
-| `.synapse/ops.CURSOR.md` | Cursor-specific MCP + hook instructions |
 
 ## E2E
 

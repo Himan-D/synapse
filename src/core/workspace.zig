@@ -535,8 +535,17 @@ pub const Workspace = struct {
         return try aw.toOwnedSlice();
     }
 
-    /// CLI ops status: config presence + per-agent event counts.
-    pub fn opsStatusJson(self: *Workspace, allocator: Allocator, ops_config_exists: bool) ![]u8 {
+    /// CLI ops status: config presence + per-agent event counts + wiring flags.
+    pub fn opsStatusJson(
+        self: *Workspace,
+        allocator: Allocator,
+        opts: struct {
+            ops_config_exists: bool,
+            hooks_installed: bool,
+            mcp_config_present: bool,
+            watching: bool,
+        },
+    ) ![]u8 {
         const evs = self.store.events("harness_events");
         var agent_counts: std.StringHashMapUnmanaged(u32) = .empty;
         defer {
@@ -544,8 +553,10 @@ pub const Workspace = struct {
             while (ait.next()) |e| allocator.free(e.key_ptr.*);
             agent_counts.deinit(allocator);
         }
+        var last_ts: ?[]const u8 = null;
         for (evs) |ev| {
             if (!opsEventType(ev.type_raw)) continue;
+            last_ts = ev.ts;
             const key = try allocator.dupe(u8, ev.agent_id);
             const gop = try agent_counts.getOrPut(allocator, key);
             if (gop.found_existing) allocator.free(key);
@@ -554,9 +565,21 @@ pub const Workspace = struct {
         }
         var aw: std.Io.Writer.Allocating = .init(allocator);
         errdefer aw.deinit();
-        try aw.writer.print("{{\"ops_config\":{s},\"datasource\":\"harness_events\",\"agents\":[", .{
-            if (ops_config_exists) "true" else "false",
+        try aw.writer.print(
+            \\{{"ops_config":{s},"capture_enabled":{s},"hooks_installed":{s},"mcp_config_present":{s},"watching":{s},"datasource":"harness_events","last_event_ts":
+        , .{
+            if (opts.ops_config_exists) "true" else "false",
+            if (opts.ops_config_exists) "true" else "false",
+            if (opts.hooks_installed) "true" else "false",
+            if (opts.mcp_config_present) "true" else "false",
+            if (opts.watching) "true" else "false",
         });
+        if (last_ts) |ts| {
+            try aw.writer.print("{f}", .{std.json.fmt(ts, .{})});
+        } else {
+            try aw.writer.writeAll("null");
+        }
+        try aw.writer.writeAll(",\"agents\":[");
         var first = true;
         var ait = agent_counts.iterator();
         while (ait.next()) |e| {
@@ -610,50 +633,82 @@ fn opsEventType(type_raw: []const u8) bool {
         std.mem.eql(u8, type_raw, "plan_step");
 }
 
-pub fn writeOpsConfig(allocator: Allocator, io: Io, root: []const u8, base_url: []const u8) !void {
+pub fn writeOpsConfig(allocator: Allocator, io: Io, root: []const u8, base_url: []const u8, synapse_bin: []const u8) !void {
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const syn_dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse", .{root});
     try Io.Dir.cwd().createDirPath(io, syn_dir);
+
+    // Resolve absolute root for MCP config.
+    const abs_root = blk: {
+        if (std.fs.path.isAbsolute(root)) break :blk try allocator.dupe(u8, root);
+        const resolved = try Io.Dir.cwd().realPathFileAlloc(io, root, allocator);
+        break :blk resolved;
+    };
+    defer allocator.free(abs_root);
+
     const ops_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.json", .{root});
-    const body =
+    var cfg_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer cfg_aw.deinit();
+    try cfg_aw.writer.print(
         \\{{
         \\  "version": 1,
+        \\  "enabled": true,
         \\  "datasource": "harness_events",
         \\  "base_url": "{s}",
         \\  "capture": ["tool_call", "error", "llm_span", "plan_step"],
         \\  "identity": {{
         \\    "agent_id_env": "SYNAPSE_AGENT_ID",
         \\    "run_id_env": "SYNAPSE_RUN_ID"
-        \\  }}
+        \\  }},
+        \\  "hooks_path": ".cursor/hooks.json",
+        \\  "mcp_config_path": ".synapse/ops.mcp.json"
         \\}}
         \\
-    ;
-    var cfg_buf: [512]u8 = undefined;
-    const cfg = try std.fmt.bufPrint(&cfg_buf, body, .{base_url});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ops_path, .data = cfg });
+    , .{base_url});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ops_path, .data = cfg_aw.written() });
 
-    const cursor_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.CURSOR.md", .{root});
-    var md_aw: std.Io.Writer.Allocating = .init(allocator);
-    defer md_aw.deinit();
-    try md_aw.writer.writeAll(
-        \\# Synapse ops capture (Cursor)
+    // Cursor hooks — project-local, visible in repo.
+    const cursor_dir = try std.fmt.bufPrint(&path_buf, "{s}/.cursor", .{root});
+    try Io.Dir.cwd().createDirPath(io, cursor_dir);
+    const hooks_path = try std.fmt.bufPrint(&path_buf, "{s}/.cursor/hooks.json", .{root});
+    var hooks_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer hooks_aw.deinit();
+    try hooks_aw.writer.writeAll(
+        \\{
+        \\  "hooks": {
+        \\    "afterToolUse": [
+        \\      {
+        \\        "description": "Synapse ops capture — POST tool_call to local Synapse",
+        \\        "command": "sh -c 'TS=$(date -u +%Y-%m-%dT%H:%M:%SZ); RUN=${SYNAPSE_RUN_ID:-run_ops}; AGENT=${SYNAPSE_AGENT_ID:-cursor}; TOOL=\"$CURSOR_TOOL_NAME\"; OK=true; curl -sf -X POST \""
+    );
+    try hooks_aw.writer.writeAll(base_url);
+    try hooks_aw.writer.writeAll(
+        \\/v1/events/harness_events\" -H \"content-type: application/x-ndjson\" --data-binary \"{\\\"ts\\\":\\\"$TS\\\",\\\"run_id\\\":\\\"$RUN\\\",\\\"agent_id\\\":\\\"$AGENT\\\",\\\"type\\\":\\\"tool_call\\\",\\\"payload\\\":{\\\"name\\\":\\\"$TOOL\\\",\\\"ok\\\":$OK}}\\n\" || true'"
+        \\      }
+        \\    ]
+        \\  }
+        \\}
         \\
-        \\Synapse records **what you wire in** — tool calls, errors, LLM spans, plan steps.
-        \\It is not IDE spyware: nothing is captured unless you point hooks or MCP at Synapse.
-        \\
-        \\## Option A — MCP (recommended)
-        \\
-        \\Add to Cursor MCP settings (stdio):
-        \\
-        \\```json
+    );
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = hooks_path, .data = hooks_aw.written() });
+
+    // MCP config snippet — paste into Cursor MCP settings or symlink.
+    const mcp_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.mcp.json", .{root});
+    var mcp_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer mcp_aw.deinit();
+    try mcp_aw.writer.writeAll(
         \\{
         \\  "mcpServers": {
         \\    "synapse-ops": {
-        \\      "command": "/path/to/synapse",
+        \\      "command": "
+    );
+    try mcp_aw.writer.writeAll(synapse_bin);
+    try mcp_aw.writer.writeAll(
+        \\",
         \\      "args": ["ops", "mcp", "--root", "
     );
-    try md_aw.writer.writeAll(root);
-    try md_aw.writer.writeAll(
+    try mcp_aw.writer.writeAll(abs_root);
+    try mcp_aw.writer.writeAll(
         \\"],
         \\      "env": {
         \\        "SYNAPSE_AGENT_ID": "cursor",
@@ -662,13 +717,46 @@ pub fn writeOpsConfig(allocator: Allocator, io: Io, root: []const u8, base_url: 
         \\    }
         \\  }
         \\}
+        \\
+    );
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mcp_path, .data = mcp_aw.written() });
+
+    const cursor_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.CURSOR.md", .{root});
+    var md_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer md_aw.deinit();
+    try md_aw.writer.writeAll(
+        \\# Synapse ops capture (Cursor)
+        \\
+        \\**Automatic after `synapse ops init`** — hooks and MCP config are written to
+        \\this repo. Nothing is hidden: check wiring anytime with `synapse ops status`.
+        \\
+        \\Synapse records **what you wire in** — tool calls, errors, LLM spans, plan steps.
+        \\It is not IDE spyware: capture is visible in `.synapse/ops.json`, `.cursor/hooks.json`,
+        \\and `.synapse/ops.mcp.json`.
+        \\
+        \\## Files written by init
+        \\
+        \\| File | Purpose |
+        \\|---|---|
+        \\| `.synapse/ops.json` | Capture config (`enabled: true`) |
+        \\| `.cursor/hooks.json` | Cursor afterToolUse hook |
+        \\| `.synapse/ops.mcp.json` | MCP server snippet for Cursor |
+        \\
+        \\## Option A — MCP (recommended)
+        \\
+        \\Merge `.synapse/ops.mcp.json` into Cursor MCP settings, or:
+        \\
+        \\```json
+    );
+    try md_aw.writer.writeAll(mcp_aw.written());
+    try md_aw.writer.writeAll(
         \\```
         \\
         \\Every `tools/call` through this MCP server is logged to `harness_events`.
         \\
-        \\## Option B — afterToolUse hook
+        \\## Option B — afterToolUse hook (already installed)
         \\
-        \\See `examples/ops/cursor-hooks.example.json`. POST NDJSON to:
+        \\See `.cursor/hooks.json`. POST NDJSON to:
         \\
     );
     try md_aw.writer.writeAll(base_url);
@@ -692,6 +780,12 @@ pub fn writeOpsConfig(allocator: Allocator, io: Io, root: []const u8, base_url: 
         \\
     );
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = cursor_path, .data = md_aw.written() });
+}
+
+/// Check whether a path exists relative to cwd.
+pub fn pathExists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
 }
 
 fn formatUtcNow(allocator: Allocator, io: Io) ![]u8 {

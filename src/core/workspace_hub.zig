@@ -6,6 +6,7 @@ const Io = std.Io;
 const workspace_mod = @import("workspace.zig");
 const platform_mod = @import("platform.zig");
 const usage_mod = @import("usage.zig");
+const audit_mod = @import("audit.zig");
 const auth_mod = @import("auth.zig");
 
 /// Result of an authorization check.
@@ -23,6 +24,7 @@ pub const WorkspaceHub = struct {
     data_root: []const u8,
     platform: platform_mod.PlatformStore,
     usage: usage_mod.UsageStore,
+    audit: audit_mod.AuditStore,
     /// Lazily loaded workspaces, keyed by workspace id.
     loaded: std.StringHashMapUnmanaged(*workspace_mod.Workspace) = .empty,
 
@@ -30,12 +32,14 @@ pub const WorkspaceHub = struct {
         var platform = try platform_mod.PlatformStore.init(allocator, io, data_root);
         errdefer platform.deinit();
         const usage = try usage_mod.UsageStore.init(allocator, io, data_root);
+        const audit = try audit_mod.AuditStore.init(allocator, io, data_root);
         return .{
             .allocator = allocator,
             .io = io,
             .data_root = try allocator.dupe(u8, data_root),
             .platform = platform,
             .usage = usage,
+            .audit = audit,
         };
     }
 
@@ -49,6 +53,7 @@ pub const WorkspaceHub = struct {
         while (kit.next()) |k| self.allocator.free(k.*);
         self.loaded.deinit(self.allocator);
         self.usage.deinit();
+        self.audit.deinit();
         self.platform.deinit();
         self.allocator.free(self.data_root);
         self.* = undefined;
@@ -170,6 +175,11 @@ test "hub get unknown workspace" {
             .io = undefined,
             .data_root = try gpa.dupe(u8, tmp_dir),
         },
+        .audit = .{
+            .allocator = gpa,
+            .io = undefined,
+            .data_root = try gpa.dupe(u8, tmp_dir),
+        },
     };
     defer hub.deinit();
 
@@ -189,6 +199,11 @@ test "authorizeForWorkspace: 401 vs 403 distinction" {
             .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
         },
         .usage = .{
+            .allocator = gpa,
+            .io = undefined,
+            .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
+        },
+        .audit = .{
             .allocator = gpa,
             .io = undefined,
             .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),

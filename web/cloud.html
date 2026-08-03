@@ -116,6 +116,7 @@
       <button data-get="/v1/platform/orgs">List orgs</button>
       <button data-get="/v1/platform/workspaces">List workspaces</button>
       <button data-get="/v1/platform/usage">Usage counters</button>
+      <button data-get="/v1/platform/audit">Audit log</button>
       <button id="list-tokens">List tokens for workspace…</button>
 
       <h2>Write</h2>
@@ -127,6 +128,7 @@
       <input id="tok-ws" placeholder="ws_… (workspace)" />
       <input id="tok-name" placeholder="token name" />
       <input id="tok-scope" placeholder="scope (default ADMIN)" />
+      <input id="tok-ttl" placeholder="ttl_seconds (optional)" />
       <button id="mint-token">Mint token</button>
       <input id="revoke-id" placeholder="tok_… (token id)" />
       <button id="revoke-token">Revoke token</button>
@@ -217,11 +219,14 @@
     $("mint-token").addEventListener("click", () => {
       const ws = required("tok-ws", "workspace id");
       if (!ws) return;
-      call("POST", "/v1/platform/tokens", {
+      const body = {
         workspace_id: ws,
         name: $("tok-name").value.trim() || "api",
         scope: $("tok-scope").value.trim() || "ADMIN",
-      });
+      };
+      const ttl = $("tok-ttl").value.trim();
+      if (ttl) body.ttl_seconds = parseInt(ttl, 10);
+      call("POST", "/v1/platform/tokens", body);
     });
 
     $("revoke-token").addEventListener("click", () => {

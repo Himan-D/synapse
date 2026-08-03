@@ -34,10 +34,13 @@ jobs:
         run: zig build
 
       - name: Make scripts executable
-        run: chmod +x scripts/e2e.sh scripts/e2e_cloud.sh
+        run: chmod +x scripts/e2e.sh scripts/e2e_cloud.sh scripts/e2e_ops.sh
 
       - name: E2E
         run: ./scripts/e2e.sh
+
+      - name: E2E ops
+        run: ./scripts/e2e_ops.sh
 
       - name: E2E cloud
         run: ./scripts/e2e_cloud.sh

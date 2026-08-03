@@ -11,7 +11,7 @@ See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md)
 | Mode | Command | Status |
 |---|---|---|
 | **Local single-root** — one workspace per process | `synapse dev --root <dir>` | **Stable.** The recommended path. Start with `./scripts/demo.sh`. |
-| **Cloud multi-tenant** — many workspaces, orgs, scoped tokens | `synapse cloud serve` | **Phase C beta.** The HTTP contract is stable and workspace isolation is covered by `scripts/e2e_cloud.sh` in CI, but it has far less production mileage, and tokens have no expiry or rotation (revoke and re-mint instead). See [docs/CLOUD.md](docs/CLOUD.md) and [docs/CLOUD_COMPANY.md](docs/CLOUD_COMPANY.md). |
+| **Cloud multi-tenant** — many workspaces, orgs, scoped tokens | `synapse cloud serve` | **Phase C beta.** Workspace isolation covered by `scripts/e2e_cloud.sh` in CI. Tokens support optional TTL (`--ttl` / `ttl_seconds`), revoke, and hash-at-rest. Soft quotas via `SYNAPSE_QUOTA_*` env vars. See [docs/CLOUD.md](docs/CLOUD.md) and [docs/CLOUD_COMPANY.md](docs/CLOUD_COMPANY.md). |
 
 Both modes read byte-identical workspace directories, so nothing you build
 locally has to be rewritten to move to cloud mode.
@@ -82,7 +82,7 @@ curl -s -X POST 'http://127.0.0.1:8787/v1/remember' \
 | `synapse endpoint --root <dir>` | List published endpoints |
 | `synapse token show\|create [name]` | Admin / scoped tokens |
 | `synapse mcp --root <dir>` | MCP over stdio (Cursor / Claude Desktop) |
-| `synapse ops init\|mcp\|status --root <dir>` | Drop-in agent ops capture (see [docs/OPS.md](docs/OPS.md)) |
+| `synapse ops init\|mcp\|status\|watch --root <dir>` | Drop-in agent ops capture (see [docs/OPS.md](docs/OPS.md)) |
 | `synapse branch create <name>` | Snapshot local event data |
 | `synapse workflow list\|start\|signal\|tick…` | Durable workflows (Temporal/Inngest-shaped) |
 | `synapse graph --run-id <id>` | Inspect World/Work/Mind |
@@ -132,7 +132,7 @@ Drop-in **agent ops capture** for any repo — log tool calls, errors, LLM spans
 curl 'http://127.0.0.1:8787/v1/ops/activity?limit=20'
 ```
 
-**Not magic IDE spyware** — nothing is captured unless you wire hooks or MCP. Full guide: [docs/OPS.md](docs/OPS.md).
+**Not magic IDE spyware** — after `ops init`, wiring is visible in `.synapse/ops.json`, `.cursor/hooks.json`, and `synapse ops status`. Full guide: [docs/OPS.md](docs/OPS.md).
 
 Auth is opt-in in local mode: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`. Scopes are `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ` — that is the complete set. `401` means no or unknown token; `403` means a real token without the right scope. See [SECURITY.md](SECURITY.md).  
 Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning in `dev` and is refused outright by `cloud serve`).  
