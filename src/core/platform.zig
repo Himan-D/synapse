@@ -95,13 +95,13 @@ pub const PlatformStore = struct {
             self.allocator.free(o.id);
             self.allocator.free(o.name);
         }
-        self.orgs.clearRetainingCapacity(self.allocator);
+        self.orgs.clearRetainingCapacity();
         for (self.workspaces.items) |w| {
             self.allocator.free(w.id);
             self.allocator.free(w.name);
             self.allocator.free(w.org_id);
         }
-        self.workspaces.clearRetainingCapacity(self.allocator);
+        self.workspaces.clearRetainingCapacity();
         for (self.tokens.items) |t| {
             self.allocator.free(t.name);
             self.allocator.free(t.token);
@@ -109,7 +109,7 @@ pub const PlatformStore = struct {
             self.allocator.free(t.workspace_id);
             self.allocator.free(t.scopes);
         }
-        self.tokens.clearRetainingCapacity(self.allocator);
+        self.tokens.clearRetainingCapacity();
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{});
         defer parsed.deinit();
@@ -153,8 +153,8 @@ pub const PlatformStore = struct {
                 try self.tokens.append(self.allocator, .{
                     .name = try self.allocator.dupe(u8, t.get("name").?.string),
                     .token = try self.allocator.dupe(u8, t.get("token").?.string),
-                    .org_id = try self.allocator.dupe(u8, (t.get("org_id") orelse .{ .string = "" }).string),
-                    .workspace_id = try self.allocator.dupe(u8, (t.get("workspace_id") orelse .{ .string = "" }).string),
+                    .org_id = if (t.get("org_id")) |v| try self.allocator.dupe(u8, v.string) else try self.allocator.dupe(u8, ""),
+                    .workspace_id = if (t.get("workspace_id")) |v| try self.allocator.dupe(u8, v.string) else try self.allocator.dupe(u8, ""),
                     .scopes = try scopes.toOwnedSlice(self.allocator),
                 });
             }

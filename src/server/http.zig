@@ -581,8 +581,8 @@ fn platformControlPlane(
         defer parsed.deinit();
         const obj = parsed.value.object;
         const workspace_id = obj.get("workspace_id").?.string;
-        const name = (obj.get("name") orelse .{ .string = "api" }).string;
-        const scope = (obj.get("scope") orelse .{ .string = "ADMIN" }).string;
+        const name = if (obj.get("name")) |v| v.string else "api";
+        const scope = if (obj.get("scope")) |v| v.string else "ADMIN";
         const json = hub.platform.mintToken(workspace_id, name, scope) catch |err| switch (err) {
             error.WorkspaceNotFound => {
                 try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .bad_request, "application/json");

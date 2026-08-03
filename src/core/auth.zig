@@ -10,11 +10,12 @@ pub const Scope = enum {
     query_read,
 
     pub fn fromString(s: []const u8) ?Scope {
-        if (std.mem.eql(u8, s, "ADMIN") or std.mem.eql(u8, s, "WORKSPACE:ADMIN")) return .admin;
-        if (std.mem.eql(u8, s, "PIPES:READ")) return .pipes_read;
-        if (std.mem.eql(u8, s, "DATASOURCES:WRITE") or std.mem.eql(u8, s, "EVENTS:WRITE")) return .events_write;
-        if (std.mem.eql(u8, s, "REMEMBER:WRITE")) return .remember_write;
-        if (std.mem.eql(u8, s, "QUERY:READ")) return .query_read;
+        // Accept uppercase human-readable strings (CLI input) AND Zig @tagName() output.
+        if (std.mem.eql(u8, s, "ADMIN") or std.mem.eql(u8, s, "WORKSPACE:ADMIN") or std.mem.eql(u8, s, "admin")) return .admin;
+        if (std.mem.eql(u8, s, "PIPES:READ") or std.mem.eql(u8, s, "pipes_read")) return .pipes_read;
+        if (std.mem.eql(u8, s, "DATASOURCES:WRITE") or std.mem.eql(u8, s, "EVENTS:WRITE") or std.mem.eql(u8, s, "events_write")) return .events_write;
+        if (std.mem.eql(u8, s, "REMEMBER:WRITE") or std.mem.eql(u8, s, "remember_write")) return .remember_write;
+        if (std.mem.eql(u8, s, "QUERY:READ") or std.mem.eql(u8, s, "query_read")) return .query_read;
         return null;
     }
 };
