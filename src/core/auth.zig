@@ -93,43 +93,117 @@ pub const Auth = struct {
         return null;
     }
 
-    /// Required scope for an HTTP method+path. null means public (health).
+    /// Extract `token=` from the request-target query string on the first request line.
+    fn extractQueryToken(head_buffer: []const u8) ?[]const u8 {
+        const line_end = std.mem.indexOf(u8, head_buffer, "\r\n") orelse return null;
+        const line = head_buffer[0..line_end];
+        const q = std.mem.indexOfScalar(u8, line, '?') orelse return null;
+        const query = line[q + 1 ..];
+        var it = std.mem.splitScalar(u8, query, '&');
+        while (it.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "token=")) {
+                var val = pair["token=".len..];
+                // Strip trailing HTTP/version if somehow attached (shouldn't be after ?).
+                if (std.mem.indexOfScalar(u8, val, ' ')) |sp| val = val[0..sp];
+                if (val.len == 0) return null;
+                return val;
+            }
+        }
+        return null;
+    }
+
+    pub fn extractPresentedToken(head_buffer: []const u8) ?[]const u8 {
+        if (extractBearer(head_buffer)) |t| return t;
+        return extractQueryToken(head_buffer);
+    }
+
+    /// Required scope for an HTTP method+path. null means public (health/ui).
     pub fn requiredScope(method: std.http.Method, path: []const u8) ?Scope {
         if (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/ui")) return null;
         if (method == .POST and std.mem.startsWith(u8, path, "/v1/events/")) return .events_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) return .remember_write;
+        if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) return .remember_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/query")) return .query_read;
         if (method == .GET and std.mem.startsWith(u8, path, "/v1/datasources/")) return .query_read;
         if (method == .GET) return .pipes_read;
         if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) return .admin;
-        if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) return .remember_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/checkpoint")) return .admin;
+        if (method == .POST and std.mem.eql(u8, path, "/v1/reload")) return .admin;
         return .admin;
+    }
+
+    fn tokenHasScope(scopes: []const Scope, need: Scope) bool {
+        for (scopes) |s| {
+            if (s == .admin) return true;
+            if (s == need) return true;
+            if (need == .query_read and s == .pipes_read) return true;
+        }
+        return false;
     }
 
     pub fn authorize(self: *const Auth, head_buffer: []const u8, method: std.http.Method, path: []const u8) bool {
         const need = requiredScope(method, path) orelse return true;
-        const presented = extractBearer(head_buffer) orelse {
-            // Also allow token query param style: token=...
-            if (std.mem.indexOf(u8, head_buffer, "token=")) |_| {
-                // fall through — checked via substring match below for admin only
-            } else return false;
-            return false;
-        };
+        const presented = extractPresentedToken(head_buffer) orelse return false;
 
         if (self.admin) |admin| {
             if (std.mem.eql(u8, presented, admin)) return true;
         }
         for (self.entries.items) |e| {
             if (!std.mem.eql(u8, presented, e.token)) continue;
-            for (e.scopes) |s| {
-                if (s == .admin) return true;
-                if (s == need) return true;
-                // PIPES:READ covers query read
-                if (need == .query_read and s == .pipes_read) return true;
-            }
-            return false;
+            return tokenHasScope(e.scopes, need);
         }
         return false;
     }
 };
+
+test "requiredScope matrix" {
+    try std.testing.expect(Auth.requiredScope(.GET, "/health") == null);
+    try std.testing.expect(Auth.requiredScope(.GET, "/ui") == null);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/recall") == .pipes_read);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/embed") == .pipes_read);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/diff") == .pipes_read);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/consolidate") == .pipes_read);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/graph") == .pipes_read);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/events/harness_events") == .events_write);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/remember") == .remember_write);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/dispute") == .remember_write);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/query") == .query_read);
+    try std.testing.expect(Auth.requiredScope(.GET, "/v1/datasources/x/data") == .query_read);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/checkpoint") == .admin);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/reload") == .admin);
+    try std.testing.expect(Auth.requiredScope(.POST, "/v1/mcp") == .admin);
+}
+
+test "authorize bearer and query token" {
+    const gpa = std.testing.allocator;
+    var auth: Auth = .{ .allocator = gpa };
+    defer auth.deinit();
+    auth.admin = try gpa.dupe(u8, "admin-secret");
+    const name = try gpa.dupe(u8, "reader");
+    const token = try gpa.dupe(u8, "read-tok");
+    const scopes = try gpa.dupe(Scope, &[_]Scope{.pipes_read});
+    try auth.entries.append(gpa, .{ .name = name, .token = token, .scopes = scopes });
+
+    const head_ok =
+        "GET /v1/recall HTTP/1.1\r\n" ++
+        "Authorization: Bearer read-tok\r\n" ++
+        "\r\n";
+    try std.testing.expect(auth.authorize(head_ok, .GET, "/v1/recall"));
+
+    const head_query =
+        "GET /v1/recall?run_id=x&token=read-tok HTTP/1.1\r\n" ++
+        "\r\n";
+    try std.testing.expect(auth.authorize(head_query, .GET, "/v1/recall"));
+
+    const head_deny =
+        "POST /v1/events/harness_events HTTP/1.1\r\n" ++
+        "Authorization: Bearer read-tok\r\n" ++
+        "\r\n";
+    try std.testing.expect(!auth.authorize(head_deny, .POST, "/v1/events/harness_events"));
+
+    const head_admin =
+        "POST /v1/checkpoint HTTP/1.1\r\n" ++
+        "Authorization: Bearer admin-secret\r\n" ++
+        "\r\n";
+    try std.testing.expect(auth.authorize(head_admin, .POST, "/v1/checkpoint"));
+}

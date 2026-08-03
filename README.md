@@ -4,7 +4,7 @@
 
 > NetworkX computes on graphs. Neo4j stores graphs. Synapse runs agents on graphs.
 
-See [PRODUCT.md](PRODUCT.md) and [docs/architecture.md](docs/architecture.md).
+See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/openapi.yaml](docs/openapi.yaml), and [docs/architecture.md](docs/architecture.md).
 
 ## Requirements
 
@@ -59,7 +59,7 @@ Or run the bundled script:
 | `synapse branch create <name>` | Snapshot local event data |
 | `synapse graph --run-id <id>` | Inspect World/Work/Mind |
 | `synapse deploy --root <dir>` | Local validate (cloud promote later) |
-| `synapse dev --root <dir> --port <n>` | Serve HTTP + MCP + playground |
+| `synapse dev --root <dir> --port <n> [--host 127.0.0.1]` | Serve HTTP + MCP + playground |
 | `synapse ingest <ds> <file.ndjson> --root <dir> [--replace]` | Append (or replace) events |
 | `synapse remember "<text>" --root <dir> --run-id <id>` | Write a Mind claim |
 | `synapse pipe run <name> --root <dir> --run-id <id>` | Run a pipe offline |
@@ -83,13 +83,16 @@ Default pipes:
 | `blast_radius` | `/v1/impact` | Work/World impact |
 | `find_contradictions` | `/v1/dispute` | Opposing Mind claims |
 
-Auth is opt-in: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` from `.synapse/token`.
+Auth is opt-in: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`.  
+Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning).  
+Bodies capped at 16 MiB; query `limit` clamped to 10_000. Every response includes `X-Request-Id`.
 
 Pipe types (Tinybird-shaped): `endpoint` · `materialized` · `copy` · `sink`  
 Formats: `/v1/pipes/{name}.json|.ndjson|.csv` or `?format=`  
 Query API: `POST /v1/query` with `{ datasource, where, limit, offset }`
 
-Full Tinybird mapping: [docs/tinybird-parity.md](docs/tinybird-parity.md).
+Full Tinybird mapping: [docs/tinybird-parity.md](docs/tinybird-parity.md).  
+Production roadmap: [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md).
 
 ## MCP
 

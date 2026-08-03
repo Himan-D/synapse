@@ -1,6 +1,6 @@
 {
   "name": "@himand/synapse-sdk",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "TypeScript client for Synapse — Tinybird for AI harnesses",
   "type": "module",
   "main": "dist/client.js",

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const workspace_mod = @import("../core/workspace.zig");
+const version_mod = @import("../core/version.zig");
 
 /// Handle a thin MCP JSON-RPC body. Returns owned JSON response bytes.
 pub fn handle(allocator: Allocator, ws: *workspace_mod.Workspace, body: []const u8) ![]u8 {
@@ -20,9 +21,11 @@ pub fn handle(allocator: Allocator, ws: *workspace_mod.Workspace, body: []const 
     };
 
     if (std.mem.eql(u8, method, "initialize")) {
-        return try rpcResult(allocator, id_v,
-            \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.2.0"}}
-        );
+        var info_buf: [256]u8 = undefined;
+        const info = try std.fmt.bufPrint(&info_buf,
+            \\{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"{s}","version":"{s}"}}}}
+        , .{ version_mod.product, version_mod.version });
+        return try rpcResult(allocator, id_v, info);
     }
     if (std.mem.eql(u8, method, "tools/list")) {
         return try rpcResult(allocator, id_v,

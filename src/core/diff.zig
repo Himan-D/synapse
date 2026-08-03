@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const event_mod = @import("event.zig");
 const store_mod = @import("store.zig");
+const safe_name = @import("safe_name.zig");
 
 fn eventKey(ev: event_mod.Event) []const u8 {
     return ev.raw_json;
@@ -85,6 +86,8 @@ pub fn saveCheckpoint(
     datasource: []const u8,
     name: []const u8,
 ) ![]u8 {
+    if (!safe_name.isSafeName(name)) return error.InvalidCheckpointName;
+    if (!safe_name.isSafeName(datasource)) return error.InvalidDatasourceName;
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/checkpoints", .{root});
     try Io.Dir.cwd().createDirPath(io, dir);
@@ -157,4 +160,9 @@ pub fn diffRuns(
     }
     try aw.writer.writeAll("]}");
     return try aw.toOwnedSlice();
+}
+
+test "checkpoint name grammar" {
+    try std.testing.expect(safe_name.isSafeName("baseline"));
+    try std.testing.expect(!safe_name.isSafeName("../x"));
 }

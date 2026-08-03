@@ -1,0 +1,250 @@
+openapi: 3.0.3
+info:
+  title: Synapse HTTP API
+  description: |
+    Local-first real-time data platform for AI harnesses.
+    Datasource → Pipe → Endpoint / MCP. See docs/PRODUCTION_PLAN.md.
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:8787
+    description: Default local `synapse dev`
+paths:
+  /health:
+    get:
+      summary: Liveness + version
+      security: []
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  product: { type: string }
+                  version: { type: string }
+                  ready: { type: boolean }
+  /v1/workspace:
+    get:
+      summary: List pipes in workspace
+      responses:
+        "200":
+          description: Pipe catalog JSON
+  /v1/endpoints:
+    get:
+      summary: List published endpoints
+      responses:
+        "200":
+          description: Endpoint list
+  /v1/events/{datasource}:
+    post:
+      summary: Ingest NDJSON events
+      parameters:
+        - name: datasource
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: { type: string }
+          text/plain:
+            schema: { type: string }
+      responses:
+        "200":
+          description: Ingested count
+        "413":
+          description: Body exceeds 16 MiB
+  /v1/query:
+    post:
+      summary: Query-API analog (filter datasource)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [datasource]
+              properties:
+                datasource: { type: string }
+                where: { type: object, additionalProperties: { type: string } }
+                limit: { type: integer, minimum: 1, maximum: 10000, default: 100 }
+                offset: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated events
+  /v1/remember:
+    post:
+      summary: Store a Mind claim
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, text]
+              properties:
+                run_id: { type: string }
+                agent_id: { type: string }
+                text: { type: string }
+                confidence: { type: number }
+      responses:
+        "200":
+          description: Stored claim
+  /v1/recall:
+    get:
+      summary: Token-budgeted context pack
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: query, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Context pack }
+  /v1/plan:
+    get:
+      summary: Plan a goal into a task DAG
+      parameters:
+        - { name: goal, in: query, required: true, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Plan JSON }
+  /v1/route:
+    get:
+      summary: Route query to tool/skill
+      parameters:
+        - { name: query, in: query, required: true, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Route JSON }
+  /v1/impact:
+    get:
+      summary: Blast radius
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: node_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Impact JSON }
+  /v1/dispute:
+    get:
+      summary: Find contradictory claims
+      responses:
+        "200": { description: Contradictions }
+    post:
+      summary: Write a manual dispute
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, a, b]
+              properties:
+                run_id: { type: string }
+                a: { type: string }
+                b: { type: string }
+                reason: { type: string }
+      responses:
+        "200": { description: Dispute recorded }
+  /v1/graph:
+    get:
+      summary: World/Work/Mind graph snapshot
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Graph JSON }
+  /v1/embed:
+    get:
+      summary: Hybrid embed recall
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: query, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Ranked claims }
+  /v1/diff:
+    get:
+      summary: Diff two runs
+      parameters:
+        - { name: run_a, in: query, schema: { type: string } }
+        - { name: run_b, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Diff JSON }
+  /v1/consolidate:
+    get:
+      summary: Consolidate Mind claims
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Consolidation result }
+  /v1/checkpoint:
+    post:
+      summary: Snapshot datasource to named checkpoint
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+                datasource: { type: string, default: harness_events }
+      responses:
+        "200": { description: Checkpoint path + event count }
+        "400": { description: Invalid name }
+  /v1/reload:
+    post:
+      summary: Reload pipe definitions from disk
+      responses:
+        "200": { description: Reloaded }
+  /v1/mcp:
+    post:
+      summary: MCP JSON-RPC over HTTP
+      responses:
+        "200": { description: JSON-RPC response }
+  /v1/pipes/{name}:
+    get:
+      summary: Run a published pipe endpoint
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+        - name: format
+          in: query
+          schema: { type: string, enum: [json, ndjson, csv] }
+        - name: limit
+          in: query
+          schema: { type: integer, maximum: 10000 }
+      responses:
+        "200": { description: Pipe result }
+        "404": { description: Unknown pipe }
+  /v1/datasources/{name}/data:
+    get:
+      summary: Tinybird-style datasource data API
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, maximum: 10000 }
+        - name: offset
+          in: query
+          schema: { type: integer }
+      responses:
+        "200": { description: Filtered rows }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Scoped workspace token. Enable with SYNAPSE_REQUIRE_AUTH=1.
+    queryToken:
+      type: apiKey
+      in: query
+      name: token
+security:
+  - bearerAuth: []
+  - queryToken: []

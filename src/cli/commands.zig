@@ -109,9 +109,15 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const root = flagOr(args, "--root", ".");
         const port_s = flagOr(args, "--port", "8787");
         const port = try std.fmt.parseInt(u16, port_s, 10);
+        const host_flag = flagOr(args, "--host", "");
+        const host: []const u8 = blk: {
+            if (host_flag.len > 0) break :blk host_flag;
+            if (std.c.getenv("SYNAPSE_HOST")) |v| break :blk std.mem.span(v);
+            break :blk "127.0.0.1";
+        };
         var ws = try workspace_mod.Workspace.load(allocator, io, root);
         defer ws.deinit();
-        try http_mod.serve(allocator, io, &ws, port);
+        try http_mod.serve(allocator, io, &ws, .{ .host = host, .port = port });
         return;
     }
     if (std.mem.eql(u8, cmd, "ingest")) {
@@ -317,7 +323,7 @@ fn printHelp() !void {
         \\  synapse graph --root <dir> --run-id <id>
         \\  synapse deploy --root <dir>
         \\  synapse mcp --root <dir>
-        \\  synapse dev --root <dir> --port <port>
+        \\  synapse dev --root <dir> --port <port> [--host 127.0.0.1]
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
         \\  synapse pipe run <name> --root <dir> [--run-id <id>] [k=v...]
@@ -325,9 +331,10 @@ fn printHelp() !void {
         \\
         \\Env:
         \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens
+        \\  SYNAPSE_HOST            bind address (default 127.0.0.1)
         \\
         \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
-        \\See docs/tinybird-parity.md and PRODUCT.md.
+        \\See docs/PRODUCTION_PLAN.md, docs/openapi.yaml, and PRODUCT.md.
         \\
     ;
     std.debug.print("{s}", .{help});

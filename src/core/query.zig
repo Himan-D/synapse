@@ -3,6 +3,19 @@ const Allocator = std.mem.Allocator;
 const store_mod = @import("store.zig");
 const event_mod = @import("event.zig");
 
+/// Hard ceiling for query/pagination windows (production bound).
+pub const max_limit: usize = 10_000;
+pub const default_limit: usize = 100;
+
+pub fn clampLimit(n: usize) usize {
+    if (n == 0) return default_limit;
+    return @min(n, max_limit);
+}
+
+pub fn clampOffset(n: usize) usize {
+    return @min(n, 1_000_000);
+}
+
 /// Tinybird Query-API analog: filter a datasource without owning SQL.
 /// Body/params: datasource, where{...}, limit, offset.
 pub fn runQuery(
@@ -13,11 +26,13 @@ pub fn runQuery(
     limit: usize,
     offset: usize,
 ) ![]u8 {
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
     const all = try store.filterEvents(allocator, datasource, where);
     defer allocator.free(all);
 
-    const start = @min(offset, all.len);
-    const end = @min(start + limit, all.len);
+    const start = @min(off, all.len);
+    const end = @min(start + lim, all.len);
     const slice = all[start..end];
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -25,7 +40,7 @@ pub fn runQuery(
     try aw.writer.print(
         \\{{"meta":{{"datasource":{f},"total":{d},"offset":{d},"limit":{d},"returned":{d}}},"data":[
     ,
-        .{ std.json.fmt(datasource, .{}), all.len, offset, limit, slice.len },
+        .{ std.json.fmt(datasource, .{}), all.len, off, lim, slice.len },
     );
     for (slice, 0..) |ev, i| {
         if (i > 0) try aw.writer.writeAll(",");
@@ -35,14 +50,16 @@ pub fn runQuery(
     return try aw.toOwnedSlice();
 }
 
-pub fn parseLimit(params: std.StringHashMapUnmanaged([]const u8), default_limit: usize) usize {
-    const s = params.get("limit") orelse return default_limit;
-    return std.fmt.parseInt(usize, s, 10) catch default_limit;
+pub fn parseLimit(params: std.StringHashMapUnmanaged([]const u8), default: usize) usize {
+    const s = params.get("limit") orelse return clampLimit(default);
+    const n = std.fmt.parseInt(usize, s, 10) catch return clampLimit(default);
+    return clampLimit(n);
 }
 
 pub fn parseOffset(params: std.StringHashMapUnmanaged([]const u8)) usize {
     const s = params.get("offset") orelse return 0;
-    return std.fmt.parseInt(usize, s, 10) catch 0;
+    const n = std.fmt.parseInt(usize, s, 10) catch return 0;
+    return clampOffset(n);
 }
 
 /// Apply limit/offset to a JSON array-bearing result by wrapping metadata.
@@ -92,6 +109,9 @@ pub fn applyPagination(allocator: Allocator, json: []const u8, limit: ?usize, of
     return try aw.toOwnedSlice();
 }
 
-test "runQuery empty" {
+test "clampLimit bounds" {
+    try std.testing.expectEqual(@as(usize, 100), clampLimit(0));
+    try std.testing.expectEqual(@as(usize, 50), clampLimit(50));
+    try std.testing.expectEqual(max_limit, clampLimit(max_limit + 1));
     _ = event_mod.EventType;
 }
