@@ -258,7 +258,8 @@ pub fn execute(
                     .context_pack => {
                         const g = &(graph orelse return error.GraphRequired);
                         const query = params.get("query") orelse "";
-                        const pack = try context_pack.buildPack(allocator, g, query, node.budget_tokens);
+                        const now_secs = @max(std.Io.Clock.real.now(store.io).toSeconds(), 0);
+                        const pack = try context_pack.buildPack(allocator, g, query, node.budget_tokens, now_secs);
                         if (last_json) |j| allocator.free(j);
                         last_json = pack.json; // ownership transferred
                     },
@@ -467,15 +468,39 @@ fn enqueueWebhook(allocator: Allocator, io: std.Io, root: []const u8, url: []con
     try std.Io.Dir.cwd().createDirPath(io, dir);
     const outbox = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/webhooks/outbox.ndjson", .{root});
 
+    // Best-effort local delivery; durable outbox always kept.
+    const delivered = tryDeliverWebhook(allocator, io, url, body);
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    // Append mode: read existing + append line
     if (std.Io.Dir.cwd().readFileAlloc(io, outbox, allocator, .unlimited)) |prev| {
         defer allocator.free(prev);
         try aw.writer.writeAll(prev);
     } else |_| {}
-    try aw.writer.print("{{\"url\":{f},\"body\":{f}}}\n", .{ std.json.fmt(url, .{}), std.json.fmt(body, .{}) });
+    try aw.writer.print(
+        "{{\"url\":{f},\"body\":{f},\"delivered\":{s},\"attempts\":1}}\n",
+        .{ std.json.fmt(url, .{}), std.json.fmt(body, .{}), if (delivered) "true" else "false" },
+    );
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outbox, .data = aw.written() });
+}
+
+fn tryDeliverWebhook(allocator: Allocator, io: std.Io, url: []const u8, body: []const u8) bool {
+    // Only attempt http:// URLs locally (https needs TLS bundle; keep outbox for those).
+    if (!std.mem.startsWith(u8, url, "http://")) return false;
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "user-agent", .value = "synapse/0.1.0" },
+        },
+        .keep_alive = false,
+    }) catch return false;
+    const code = @intFromEnum(result.status);
+    return code >= 200 and code < 300;
 }
 
 fn runBlastRadius(allocator: Allocator, graph: *const graph_mod.Graph, node_id: ?[]const u8) ![]u8 {

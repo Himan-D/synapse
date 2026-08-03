@@ -119,7 +119,8 @@ pub const Auth = struct {
 
     /// Required scope for an HTTP method+path. null means public (health/ui).
     pub fn requiredScope(method: std.http.Method, path: []const u8) ?Scope {
-        if (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/ui")) return null;
+        if (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/ready") or
+            std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/ui")) return null;
         if (method == .POST and std.mem.startsWith(u8, path, "/v1/events/")) return .events_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) return .remember_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) return .remember_write;
@@ -158,6 +159,7 @@ pub const Auth = struct {
 
 test "requiredScope matrix" {
     try std.testing.expect(Auth.requiredScope(.GET, "/health") == null);
+    try std.testing.expect(Auth.requiredScope(.GET, "/ready") == null);
     try std.testing.expect(Auth.requiredScope(.GET, "/ui") == null);
     try std.testing.expect(Auth.requiredScope(.GET, "/v1/recall") == .pipes_read);
     try std.testing.expect(Auth.requiredScope(.GET, "/v1/embed") == .pipes_read);

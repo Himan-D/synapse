@@ -85,7 +85,9 @@ Default pipes:
 
 Auth is opt-in: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`.  
 Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning).  
-Bodies capped at 16 MiB; query `limit` clamped to 10_000. Every response includes `X-Request-Id`.
+Optional `SYNAPSE_RATE_LIMIT=<req/s>` token-bucket per token.  
+Bodies capped at 16 MiB; query `limit` clamped to 10_000. Every response includes `X-Request-Id`.  
+Probes: `GET /health` (liveness) · `GET /ready` (pipes loaded). Datasource schemas enforced on ingest.
 
 Pipe types (Tinybird-shaped): `endpoint` · `materialized` · `copy` · `sink`  
 Formats: `/v1/pipes/{name}.json|.ndjson|.csv` or `?format=`  

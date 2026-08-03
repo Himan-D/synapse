@@ -88,7 +88,35 @@ pub fn disputeEventJson(
     return try aw.toOwnedSlice();
 }
 
-/// Decay multiplier in (0,1]: half-life from claim props, age from valid_from/ts.
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` (optional fractional seconds) to unix seconds.
+pub fn parseIsoUtc(s: []const u8) ?i64 {
+    if (s.len < 19) return null;
+    if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') return null;
+    const year: i32 = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const month: u32 = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    const day: u32 = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    const hour: u32 = std.fmt.parseInt(u32, s[11..13], 10) catch return null;
+    const minute: u32 = std.fmt.parseInt(u32, s[14..16], 10) catch return null;
+    const second: u32 = std.fmt.parseInt(u32, s[17..19], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return null;
+    const days = daysFromCivil(year, month, day);
+    return days * 86400 + @as(i64, @intCast(hour * 3600 + minute * 60 + second));
+}
+
+/// Howard Hinnant civil-from-days inverse (UTC calendar → days since 1970-01-01).
+fn daysFromCivil(year: i32, month: u32, day: u32) i64 {
+    var y: i64 = year;
+    const m: i64 = month;
+    const d: i64 = day;
+    y -= @intFromBool(m <= 2);
+    const era: i64 = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400;
+    const doy: i64 = @divTrunc((153 * (m + @as(i64, if (m > 2) -3 else 9)) + 2), 5) + d - 1;
+    const doe: i64 = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Decay multiplier in (0,1]: half-life from claim props, age from age_secs or ISO valid_from/ts.
 pub fn decayFactor(allocator: Allocator, props_json: []const u8, now_secs: i64) f32 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, props_json, .{}) catch return 1.0;
     defer parsed.deinit();
@@ -105,19 +133,27 @@ pub fn decayFactor(allocator: Allocator, props_json: []const u8, now_secs: i64) 
         break :blk 604800.0; // 7d default
     };
     if (half <= 0) return 1.0;
-    // Without full ISO parse, use hash of valid_from length as weak age proxy when missing;
-    // prefer numeric `age_secs` if present.
+
+    var age: f32 = 0;
     if (obj.get("age_secs")) |v| {
-        const age: f32 = switch (v) {
-            .integer => |i| @floatFromInt(i),
-            .float => |f| @floatCast(f),
+        age = switch (v) {
+            .integer => |i| @floatFromInt(@max(i, 0)),
+            .float => |f| @floatCast(@max(f, 0)),
             else => 0,
         };
-        return std.math.pow(f32, 0.5, age / half);
+    } else if (now_secs > 0) {
+        const stamp = blk: {
+            if (obj.get("valid_from")) |v| if (v == .string) break :blk v.string;
+            if (obj.get("ts")) |v| if (v == .string) break :blk v.string;
+            break :blk null;
+        };
+        if (stamp) |iso| {
+            if (parseIsoUtc(iso)) |then| {
+                age = @floatFromInt(@max(now_secs - then, 0));
+            }
+        }
     }
-    _ = now_secs;
-    // Soft default: if confidence is present but no age, slight freshness penalty none
-    return 1.0;
+    return std.math.pow(f32, 0.5, age / half);
 }
 
 fn tokenSet(allocator: Allocator, text: []const u8) !std.StringArrayHashMapUnmanaged(void) {
@@ -310,4 +346,15 @@ test "claimId stable" {
     const b = try claimId(std.testing.allocator, "hello");
     defer std.testing.allocator.free(b);
     try std.testing.expectEqualStrings(a, b);
+}
+
+test "parseIsoUtc and decayFactor" {
+    try std.testing.expectEqual(@as(i64, 0), parseIsoUtc("1970-01-01T00:00:00Z").?);
+    try std.testing.expectEqual(@as(i64, 86400), parseIsoUtc("1970-01-02T00:00:00Z").?);
+    const props =
+        \\{"text":"x","confidence":0.9,"decay_half_life":3600,"valid_from":"1970-01-01T00:00:00Z"}
+    ;
+    // After one half-life → 0.5
+    const d = decayFactor(std.testing.allocator, props, 3600);
+    try std.testing.expect(d > 0.49 and d < 0.51);
 }

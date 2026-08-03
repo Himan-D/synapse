@@ -118,6 +118,17 @@ fn callTool(allocator: Allocator, ws: *workspace_mod.Workspace, name: []const u8
     return error.UnknownTool;
 }
 
+fn jsonValueToOwnedString(allocator: Allocator, v: std.json.Value) ![]const u8 {
+    return switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .null => try allocator.dupe(u8, ""),
+        else => error.InvalidParams,
+    };
+}
+
 fn runNamed(
     allocator: Allocator,
     ws: *workspace_mod.Workspace,
@@ -126,14 +137,19 @@ fn runNamed(
     keys: []const []const u8,
 ) ![]u8 {
     var params: std.StringHashMapUnmanaged([]const u8) = .empty;
-    defer params.deinit(allocator);
+    defer {
+        var it = params.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        params.deinit(allocator);
+    }
     for (keys) |k| {
         if (args.object.get(k)) |v| {
-            try params.put(allocator, k, v.string);
+            const s = try jsonValueToOwnedString(allocator, v);
+            try params.put(allocator, k, s);
         }
     }
     const result = try ws.runPipe(pipe_name, params);
-    return result.json;
+    return result.json; // caller owns; PipeResult only wraps the slice
 }
 
 fn rpcResult(allocator: Allocator, id_v: ?std.json.Value, result_json: []const u8) ![]u8 {

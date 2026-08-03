@@ -27,7 +27,22 @@ paths:
                   ok: { type: boolean }
                   product: { type: string }
                   version: { type: string }
+  /ready:
+    get:
+      summary: Readiness (pipes loaded)
+      security: []
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
                   ready: { type: boolean }
+                  pipes: { type: integer }
+        "503":
+          description: Not ready
   /v1/workspace:
     get:
       summary: List pipes in workspace

@@ -83,12 +83,15 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 
 ### Phase B — Harness-grade reliability (next)
 
-- Schema enforce on ingest (reject unknown fields when declared)  
-- Pipe reload file watch with debounce  
-- Belief decay with ISO age parsing  
-- Webhook sink: real HTTP POST + retry/backoff  
-- Rate limit token bucket per token (optional env)  
-- Ready vs live probes (`/health` live, `/ready` store loaded)  
+- [x] Schema enforce on ingest (reject missing `required` when declared)
+- [x] Pipe reload file watch with mtime debounce (on accept loop)
+- [x] Belief decay with ISO-8601 `valid_from`/`ts` aging
+- [x] Webhook sink: best-effort HTTP POST for `http://` + durable outbox
+- [x] Rate limit token bucket per token (`SYNAPSE_RATE_LIMIT`)
+- [x] Ready vs live probes (`/health` live, `/ready` pipes loaded)
+- [x] MCP Content-Length framing (+ NDJSON fallback); numeric arg coercion
+- [ ] Webhook retry/backoff drain worker (outbox rows record `delivered`)
+- [ ] HTTPS webhook delivery (TLS bundle)  
 
 ### Phase C — Platform / cloud beta
 

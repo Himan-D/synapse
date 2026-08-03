@@ -40,11 +40,13 @@ const Ranked = struct {
 };
 
 /// Build a token-budgeted JSON context pack from a graph.
+/// `now_secs` is unix UTC seconds used for Mind claim decay (0 disables ISO aging).
 pub fn buildPack(
     allocator: Allocator,
     graph: *const graph_mod.Graph,
     query: []const u8,
     budget_tokens: usize,
+    now_secs: i64,
 ) !ContextPack {
     var ranked: std.ArrayList(Ranked) = .empty;
     defer ranked.deinit(allocator);
@@ -56,7 +58,7 @@ pub fn buildPack(
         else
             1.0;
         const decay = if (std.mem.eql(u8, node.kind, "claim"))
-            belief_mod.decayFactor(allocator, node.props_json, 0)
+            belief_mod.decayFactor(allocator, node.props_json, now_secs)
         else
             1.0;
         const score = (node.score + kindBoost(node.kind) + queryBoost(query, node)) * conf * decay;
@@ -191,7 +193,7 @@ test "context pack respects budget and includes claims" {
     var g = try graph_mod.materialize(std.testing.allocator, &events, &layers);
     defer g.deinit();
 
-    var pack = try buildPack(std.testing.allocator, &g, "risk", 4000);
+    var pack = try buildPack(std.testing.allocator, &g, "risk", 4000, 0);
     defer pack.deinit();
     try std.testing.expect(std.mem.indexOf(u8, pack.json, "claim:") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.json, "citations") != null);

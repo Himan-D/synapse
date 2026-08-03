@@ -104,7 +104,18 @@ echo "==> health version"
 HEALTH=$(curl -sf "http://127.0.0.1:8787/health")
 echo "$HEALTH"
 echo "$HEALTH" | grep -q '"version":"0.1.0"'
-echo "$HEALTH" | grep -q '"ready":true'
+echo "$HEALTH" | grep -q '"ok":true'
+
+echo "==> ready probe"
+READY=$(curl -sf "http://127.0.0.1:8787/ready")
+echo "$READY"
+echo "$READY" | grep -q '"ready":true'
+
+echo "==> schema reject"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8787/v1/events/harness_events" \
+  -H "content-type: application/x-ndjson" \
+  -d '{"run_id":"x","type":"tool_call"}')
+test "$code" = "400"
 
 echo "==> request id header"
 RID=$(curl -sf -D - -o /dev/null "http://127.0.0.1:8787/health" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-request-id"{print $2}')

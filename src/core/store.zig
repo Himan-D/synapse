@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const event_mod = @import("event.zig");
+const schema_mod = @import("schema.zig");
 
 pub const builtin_datasources = [_][]const u8{
     "harness_events",
@@ -19,6 +20,9 @@ pub const Store = struct {
     root_dir: []const u8,
     /// datasource -> owned events
     tables: std.StringArrayHashMapUnmanaged(std.ArrayList(event_mod.Event)) = .empty,
+    schemas: std.StringArrayHashMapUnmanaged(schema_mod.Schema) = .empty,
+    /// When true, ingest rejects events that fail datasource schema.required.
+    enforce_schema: bool = true,
 
     pub fn init(allocator: Allocator, io: Io, root_dir: []const u8) !Store {
         var self: Store = .{
@@ -32,6 +36,7 @@ pub const Store = struct {
             try self.ensureDatasource(ds);
         }
         try self.loadAll();
+        try schema_mod.loadSchemas(allocator, io, root_dir, &self.schemas);
         return self;
     }
 
@@ -43,6 +48,12 @@ pub const Store = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.tables.deinit(self.allocator);
+        var sit = self.schemas.iterator();
+        while (sit.next()) |e| {
+            e.value_ptr.deinit(self.allocator);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.schemas.deinit(self.allocator);
         self.allocator.free(self.root_dir);
         self.* = undefined;
     }
@@ -100,6 +111,10 @@ pub const Store = struct {
 
     pub fn ingestLine(self: *Store, ds: []const u8, line: []const u8) !void {
         try self.ensureDatasource(ds);
+        if (self.enforce_schema) {
+            const sch = self.schemas.getPtr(ds);
+            try schema_mod.validateEvent(self.allocator, sch, line);
+        }
         const ev = try event_mod.parseEvent(self.allocator, line);
         errdefer {
             var tmp = ev;

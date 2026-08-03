@@ -271,23 +271,68 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
 }
 
 fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void {
-    // Line-delimited JSON-RPC over stdin/stdout for Cursor / Claude Desktop.
+    // Supports MCP Content-Length framing and NDJSON line-delimited fallback.
     var stdin_buf: [64 * 1024]u8 = undefined;
     var stdout_buf: [64 * 1024]u8 = undefined;
     var in_reader = Io.File.stdin().reader(io, &stdin_buf);
     var out_writer = Io.File.stdout().writer(io, &stdout_buf);
+    const reader = &in_reader.interface;
 
     while (true) {
-        const line = in_reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        const first = reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => |e| return e,
         };
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
-        const resp = try mcp_mod.handle(allocator, ws, trimmed);
+        if (first == '{') {
+            // NDJSON: rest of line is JSON body after leading '{'
+            const rest = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => |e| return e,
+            };
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try aw.writer.writeByte('{');
+            try aw.writer.writeAll(std.mem.trimEnd(u8, rest, " \t\r"));
+            const resp = try mcp_mod.handle(allocator, ws, aw.written());
+            defer allocator.free(resp);
+            try out_writer.interface.writeAll(resp);
+            try out_writer.interface.writeAll("\n");
+            try out_writer.interface.flush();
+            continue;
+        }
+
+        // Content-Length framed: accumulate headers until blank line.
+        var header_aw: std.Io.Writer.Allocating = .init(allocator);
+        defer header_aw.deinit();
+        try header_aw.writer.writeByte(first);
+        while (true) {
+            const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => |e| return e,
+            };
+            try header_aw.writer.writeAll(line);
+            try header_aw.writer.writeAll("\n");
+            if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
+        }
+        const headers = header_aw.written();
+        var content_len: ?usize = null;
+        var hit = std.mem.splitScalar(u8, headers, '\n');
+        while (hit.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
+                const v = std.mem.trim(u8, line["Content-Length:".len..], " \t");
+                content_len = std.fmt.parseInt(usize, v, 10) catch null;
+            }
+        }
+        const n = content_len orelse continue;
+        const body = try allocator.alloc(u8, n);
+        defer allocator.free(body);
+        try reader.readSliceAll(body);
+        const resp = try mcp_mod.handle(allocator, ws, body);
         defer allocator.free(resp);
+        try out_writer.interface.print("Content-Length: {d}\r\n\r\n", .{resp.len});
         try out_writer.interface.writeAll(resp);
-        try out_writer.interface.writeAll("\n");
         try out_writer.interface.flush();
     }
 }
@@ -332,6 +377,7 @@ fn printHelp() !void {
         \\Env:
         \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens
         \\  SYNAPSE_HOST            bind address (default 127.0.0.1)
+        \\  SYNAPSE_RATE_LIMIT=N    token-bucket requests/sec (0=off)
         \\
         \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
         \\See docs/PRODUCTION_PLAN.md, docs/openapi.yaml, and PRODUCT.md.

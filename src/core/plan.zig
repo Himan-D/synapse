@@ -176,7 +176,8 @@ fn catalogFromDefaults(allocator: Allocator) !ToolCatalog {
 }
 
 /// Goal keywords → desired provides.
-fn goalProvides(allocator: Allocator, goal: []const u8) ![]const []const u8 {
+/// When `catalog` is non-empty, also match goal tokens against catalog `provides` strings.
+fn goalProvides(allocator: Allocator, goal: []const u8, catalog: []const Tool) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
     const lower_buf = try allocator.alloc(u8, goal.len);
@@ -184,21 +185,39 @@ fn goalProvides(allocator: Allocator, goal: []const u8) ![]const []const u8 {
     for (goal, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
     const g = lower_buf;
 
+    const appendUnique = struct {
+        fn go(list: *std.ArrayList([]const u8), alloc: Allocator, s: []const u8) !void {
+            for (list.items) |x| if (std.mem.eql(u8, x, s)) return;
+            try list.append(alloc, s);
+        }
+    }.go;
+
     if (std.mem.indexOf(u8, g, "test") != null or std.mem.indexOf(u8, g, "verify") != null) {
-        try out.append(allocator, "test_report");
+        try appendUnique(&out, allocator, "test_report");
     }
     if (std.mem.indexOf(u8, g, "fix") != null or std.mem.indexOf(u8, g, "patch") != null or std.mem.indexOf(u8, g, "implement") != null) {
-        try out.append(allocator, "patch");
+        try appendUnique(&out, allocator, "patch");
     }
     if (std.mem.indexOf(u8, g, "deploy") != null or std.mem.indexOf(u8, g, "ship") != null) {
-        try out.append(allocator, "deploy_ready");
+        try appendUnique(&out, allocator, "deploy_ready");
     }
     if (std.mem.indexOf(u8, g, "search") != null or std.mem.indexOf(u8, g, "find") != null or std.mem.indexOf(u8, g, "risk") != null) {
-        try out.append(allocator, "search_hits");
+        try appendUnique(&out, allocator, "search_hits");
+    }
+    // Catalog-driven: if goal mentions a provides token (or tool name), target it.
+    for (catalog) |t| {
+        for (t.provides) |p| {
+            if (p.len >= 3 and std.mem.indexOf(u8, g, p) != null) {
+                try appendUnique(&out, allocator, p);
+            }
+        }
+        if (t.name.len >= 3 and std.mem.indexOf(u8, g, t.name) != null) {
+            for (t.provides) |p| try appendUnique(&out, allocator, p);
+        }
     }
     if (out.items.len == 0) {
-        try out.append(allocator, "search_hits");
-        try out.append(allocator, "file_contents");
+        try appendUnique(&out, allocator, "search_hits");
+        try appendUnique(&out, allocator, "file_contents");
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -237,7 +256,7 @@ pub fn planGoal(allocator: Allocator, goal: []const u8, graph: ?*const graph_mod
 
     const catalog = if (tools.len > 0) tools else default_tools[0..];
 
-    const targets = try goalProvides(allocator, goal);
+    const targets = try goalProvides(allocator, goal, catalog);
     defer allocator.free(targets);
 
     var steps: std.ArrayList(struct { name: []const u8, provides: []const []const u8 }) = .empty;

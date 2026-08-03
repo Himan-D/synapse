@@ -7,6 +7,8 @@ const format_mod = @import("../core/format.zig");
 const query_mod = @import("../core/query.zig");
 const version_mod = @import("../core/version.zig");
 const safe_name = @import("../core/safe_name.zig");
+const ratelimit_mod = @import("../core/ratelimit.zig");
+const auth_mod = @import("../core/auth.zig");
 
 pub const max_body_bytes: usize = 16 * 1024 * 1024;
 
@@ -54,6 +56,44 @@ fn envTruthy(name: [*:0]const u8) bool {
     return false;
 }
 
+fn envRateLimit() f64 {
+    if (std.c.getenv("SYNAPSE_RATE_LIMIT")) |v| {
+        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0;
+    }
+    return 0;
+}
+
+fn pipesDirMtime(io: Io, root: []const u8) i128 {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const pipes_dir = std.fmt.bufPrint(&path_buf, "{s}/pipes", .{root}) catch return 0;
+    var dir = Io.Dir.cwd().openDir(io, pipes_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var newest: i128 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".pipe.json")) continue;
+        var fpath: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&fpath, "{s}/{s}", .{ pipes_dir, entry.name }) catch continue;
+        const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        const ns = st.mtime.toNanoseconds();
+        if (ns > newest) newest = ns;
+    }
+    return newest;
+}
+
+fn maybeReloadPipes(io: Io, ws: *workspace_mod.Workspace, last_mtime: *i128) void {
+    const m = pipesDirMtime(io, ws.root);
+    if (m == 0 or m <= last_mtime.*) return;
+    // Debounce: only reload if mtime advanced.
+    last_mtime.* = m;
+    ws.reloadPipes() catch |err| {
+        std.log.warn("pipe reload failed: {s}", .{@errorName(err)});
+        return;
+    };
+    std.log.info("pipes reloaded (mtime watch)", .{});
+}
+
 pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, config: ServeConfig) !void {
     g_shutdown.store(false, .seq_cst);
     installSignalHandlers();
@@ -69,22 +109,31 @@ pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, config:
     }
     std.log.info("synapse listening on http://{s}:{d} version={s}", .{ config.host, config.port, version_mod.version });
 
+    var limiter: ?ratelimit_mod.Limiter = null;
+    const rate = envRateLimit();
+    if (rate > 0) {
+        limiter = ratelimit_mod.Limiter.init(allocator, rate, @max(rate, 1));
+        std.log.info("rate limit enabled: {d:.1} req/s", .{rate});
+    }
+    defer if (limiter) |*l| l.deinit();
+
+    var last_pipes_mtime: i128 = pipesDirMtime(io, ws.root);
+
     while (!g_shutdown.load(.seq_cst)) {
+        maybeReloadPipes(io, ws, &last_pipes_mtime);
         var stream = server.accept(io) catch |err| {
             if (g_shutdown.load(.seq_cst)) break;
             switch (err) {
                 error.SocketNotListening => break,
                 error.ConnectionAborted => continue,
                 else => {
-                    // After listen-socket shutdown, some platforms surface
-                    // unexpected errno; treat as stop when shutting down.
                     if (g_shutdown.load(.seq_cst)) break;
                     std.log.err("accept failed: {s}", .{@errorName(err)});
                     continue;
                 },
             }
         };
-        handleConn(allocator, io, ws, &stream, config.max_body_bytes) catch |err| {
+        handleConn(allocator, io, ws, &stream, config.max_body_bytes, if (limiter) |*l| l else null) catch |err| {
             std.log.err("request failed: {s}", .{@errorName(err)});
         };
         stream.close(io);
@@ -164,7 +213,14 @@ fn respond(
     });
 }
 
-fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream: *Io.net.Stream, max_body: usize) !void {
+fn handleConn(
+    allocator: Allocator,
+    io: Io,
+    ws: *workspace_mod.Workspace,
+    stream: *Io.net.Stream,
+    max_body: usize,
+    limiter: ?*ratelimit_mod.Limiter,
+) !void {
     var in_buf: [64 * 1024]u8 = undefined;
     var out_buf: [64 * 1024]u8 = undefined;
     var stream_reader = stream.reader(io, &in_buf);
@@ -194,11 +250,30 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
     if (method == .GET and std.mem.eql(u8, path, "/health")) {
         var buf: [256]u8 = undefined;
         const body = try std.fmt.bufPrint(&buf,
-            \\{{"ok":true,"product":"{s}","version":"{s}","ready":true}}
+            \\{{"ok":true,"product":"{s}","version":"{s}"}}
             \\
         , .{ version_mod.product, version_mod.version });
         try respond(&request, &meta, body, .ok, "application/json");
         return;
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/ready")) {
+        const ready = ws.pipes.count() > 0;
+        var buf: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"ready\":{s},\"pipes\":{d}}}\n", .{
+            if (ready) "true" else "false",
+            ws.pipes.count(),
+        });
+        try respond(&request, &meta, body, if (ready) .ok else .service_unavailable, "application/json");
+        return;
+    }
+
+    if (limiter) |lim| {
+        const key = auth_mod.Auth.extractPresentedToken(request.head_buffer) orelse "anon";
+        const now_ns = Io.Clock.real.now(io).toNanoseconds();
+        if (!lim.allow(key, now_ns)) {
+            try respond(&request, &meta, "{\"error\":\"rate_limited\"}\n", .too_many_requests, "application/json");
+            return;
+        }
     }
 
     const require_auth = envTruthy("SYNAPSE_REQUIRE_AUTH");
@@ -242,7 +317,13 @@ fn handleConn(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, stream
             else => |e| return e,
         };
         defer allocator.free(body);
-        const n = try ws.store.ingestNdjson(ds, body);
+        const n = ws.store.ingestNdjson(ds, body) catch |err| switch (err) {
+            error.SchemaViolation, error.InvalidJson, error.MissingField => {
+                try respond(&request, &meta, "{\"error\":\"schema_violation\"}\n", .bad_request, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
         ws.runMaterializedPipes() catch {};
         ws.logOp("ingest", ds, "ok");
         var resp_buf: [64]u8 = undefined;
