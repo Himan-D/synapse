@@ -250,6 +250,104 @@ paths:
           schema: { type: integer }
       responses:
         "200": { description: Filtered rows }
+
+  /v1/workflows:
+    get:
+      summary: List workflow definitions
+      responses:
+        "200": { description: Workflow defs }
+  /v1/workflows/{name}:
+    get:
+      summary: Show a workflow definition
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Workflow def }
+        "404": { description: Unknown workflow }
+  /v1/workflows/{name}/runs:
+    post:
+      summary: Start a durable workflow run
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input: { type: object }
+                run_id: { type: string }
+      responses:
+        "200": { description: Run started }
+  /v1/workflows/tick:
+    post:
+      summary: Tick all runnable workflow runs
+      responses:
+        "200": { description: Tick summary }
+  /v1/workflow-runs:
+    get:
+      summary: List workflow runs
+      responses:
+        "200": { description: Runs }
+  /v1/workflow-runs/{id}:
+    get:
+      summary: Get workflow run status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Run state }
+        "404": { description: Unknown run }
+  /v1/workflow-runs/{id}/signal:
+    post:
+      summary: Signal a waiting workflow run
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type: { type: string }
+                payload: {}
+      responses:
+        "200": { description: Updated run }
+  /v1/workflow-runs/{id}/cancel:
+    post:
+      summary: Cancel a workflow run
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Cancelled run }
+  /v1/workflow-runs/{id}/tick:
+    post:
+      summary: Tick one workflow run
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Updated run }
+
 components:
   securitySchemes:
     bearerAuth:

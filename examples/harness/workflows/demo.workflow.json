@@ -1,0 +1,35 @@
+{
+  "name": "demo",
+  "version": 1,
+  "retry": { "max_attempts": 3, "backoff_ms": 200, "backoff_mult": 2.0 },
+  "steps": [
+    {
+      "id": "recall",
+      "kind": "action",
+      "op": "pipe",
+      "pipe": "recall_context",
+      "params": { "run_id": "run_demo", "query": "risk" }
+    },
+    {
+      "id": "brief_pause",
+      "kind": "sleep",
+      "ms": 10
+    },
+    {
+      "id": "await_human",
+      "kind": "wait_event",
+      "type": "human.approved",
+      "timeout_ms": 600000
+    },
+    {
+      "id": "plan_fix",
+      "kind": "action",
+      "pipe": "plan_goal",
+      "params": { "goal": "fix risk bug", "run_id": "run_demo" }
+    },
+    {
+      "id": "done",
+      "kind": "noop"
+    }
+  ]
+}

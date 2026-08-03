@@ -132,6 +132,38 @@ echo "==> playground"
 curl -sf "http://127.0.0.1:8787/" | head -c 120
 echo
 
+echo "==> workflow durable run"
+rm -f "$WS/.synapse/workflows/wf_e2e.json" "$WS/.synapse/workflows/wf_http.json"
+"$BIN" workflow start demo --root "$WS" --run-id wf_e2e --input '{"source":"e2e"}' >/dev/null
+waiting=0
+for _ in $(seq 1 40); do
+  wf_st=$("$BIN" workflow status wf_e2e --root "$WS")
+  echo "$wf_st" | grep -q '"status":"failed"' && { echo "$wf_st" | head -c 400; exit 1; }
+  if echo "$wf_st" | grep -q '"wait_type":"human.approved"'; then waiting=1; break; fi
+  sleep 0.05
+  "$BIN" workflow tick --root "$WS" --run-id wf_e2e >/dev/null || true
+done
+test "$waiting" = "1"
+"$BIN" workflow signal wf_e2e --type human.approved --payload '{"ok":true}' --root "$WS" >/dev/null
+done=0
+for _ in $(seq 1 40); do
+  wf_st=$("$BIN" workflow status wf_e2e --root "$WS")
+  if echo "$wf_st" | grep -q '"status":"completed"'; then done=1; break; fi
+  echo "$wf_st" | grep -q '"status":"failed"' && { echo "$wf_st" | head -c 400; exit 1; }
+  sleep 0.05
+  "$BIN" workflow tick --root "$WS" --run-id wf_e2e >/dev/null || true
+done
+test "$done" = "1"
+echo "workflow completed"
+
+echo "==> workflow HTTP"
+curl -sf -X POST "http://127.0.0.1:8787/v1/workflows/demo/runs" \
+  -H "content-type: application/json" \
+  -d '{"run_id":"wf_http","input":{"via":"http"}}' | head -c 200
+echo
+curl -sf "http://127.0.0.1:8787/v1/workflows" | grep -q '"demo"'
+echo "workflow http ok"
+
 echo "==> auth gate"
 # Prefer SIGTERM (graceful), then SIGKILL — never block forever on wait.
 kill -TERM "$PID" 2>/dev/null || true

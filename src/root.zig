@@ -18,6 +18,7 @@ pub const version = @import("core/version.zig");
 pub const safe_name = @import("core/safe_name.zig");
 pub const schema = @import("core/schema.zig");
 pub const ratelimit = @import("core/ratelimit.zig");
+pub const workflow = @import("core/workflow.zig");
 pub const workspace = @import("core/workspace.zig");
 pub const http = @import("server/http.zig");
 pub const mcp = @import("server/mcp.zig");

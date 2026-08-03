@@ -4,7 +4,7 @@
 
 > NetworkX computes on graphs. Neo4j stores graphs. Synapse runs agents on graphs.
 
-See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/openapi.yaml](docs/openapi.yaml), and [docs/architecture.md](docs/architecture.md).
+See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/WORKFLOWS.md](docs/WORKFLOWS.md), [docs/openapi.yaml](docs/openapi.yaml), and [docs/architecture.md](docs/architecture.md).
 
 ## Requirements
 
@@ -57,6 +57,7 @@ Or run the bundled script:
 | `synapse token show\|create [name]` | Admin / scoped tokens |
 | `synapse mcp --root <dir>` | MCP over stdio (Cursor / Claude Desktop) |
 | `synapse branch create <name>` | Snapshot local event data |
+| `synapse workflow list\|start\|signal\|tick…` | Durable workflows (Temporal/Inngest-shaped) |
 | `synapse graph --run-id <id>` | Inspect World/Work/Mind |
 | `synapse deploy --root <dir>` | Local validate (cloud promote later) |
 | `synapse dev --root <dir> --port <n> [--host 127.0.0.1]` | Serve HTTP + MCP + playground |

@@ -114,6 +114,43 @@ fn callTool(allocator: Allocator, ws: *workspace_mod.Workspace, name: []const u8
         const run_id = if (args.object.get("run_id")) |r| r.string else "";
         return try ws.graphJson(allocator, run_id);
     }
+    if (std.mem.eql(u8, name, "synapse.workflow_start")) {
+        const wf = args.object.get("workflow").?.string;
+        const rid = if (args.object.get("run_id")) |r| r.string else null;
+        var input: []const u8 = "{}";
+        var input_owned: ?[]u8 = null;
+        defer if (input_owned) |o| allocator.free(o);
+        if (args.object.get("input")) |inp| {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try std.json.Stringify.value(inp, .{}, &aw.writer);
+            input_owned = try allocator.dupe(u8, aw.written());
+            input = input_owned.?;
+        }
+        return try ws.workflowStart(wf, input, rid);
+    }
+    if (std.mem.eql(u8, name, "synapse.workflow_status")) {
+        return try ws.workflowStatus(args.object.get("run_id").?.string);
+    }
+    if (std.mem.eql(u8, name, "synapse.workflow_signal")) {
+        const rid = args.object.get("run_id").?.string;
+        const typ = args.object.get("type").?.string;
+        var payload: []const u8 = "{}";
+        var payload_owned: ?[]u8 = null;
+        defer if (payload_owned) |o| allocator.free(o);
+        if (args.object.get("payload")) |p| {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try std.json.Stringify.value(p, .{}, &aw.writer);
+            payload_owned = try allocator.dupe(u8, aw.written());
+            payload = payload_owned.?;
+        }
+        return try ws.workflowSignal(rid, typ, payload);
+    }
+    if (std.mem.eql(u8, name, "synapse.workflow_tick")) {
+        if (args.object.get("run_id")) |r| return try ws.workflowTickRun(r.string);
+        return try ws.workflowTick();
+    }
 
     return error.UnknownTool;
 }

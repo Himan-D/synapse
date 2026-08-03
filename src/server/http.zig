@@ -133,6 +133,11 @@ pub fn serve(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace, config:
                 },
             }
         };
+        // Advance durable workflows (sleeps / retries) between connections.
+        if (ws.workflowTick()) |ticked| {
+            defer allocator.free(ticked);
+        } else |_| {}
+
         handleConn(allocator, io, ws, &stream, config.max_body_bytes, if (limiter) |*l| l else null) catch |err| {
             std.log.err("request failed: {s}", .{@errorName(err)});
         };
@@ -538,6 +543,161 @@ fn handleConn(
         const resp = try mcp_mod.handle(allocator, ws, body);
         defer allocator.free(resp);
         try respond(&request, &meta, resp, .ok, "application/json");
+        return;
+    }
+
+    // --- Durable workflows (Temporal / Inngest-shaped) ---
+    if (method == .GET and std.mem.eql(u8, path, "/v1/workflows")) {
+        const json = try ws.workflowList();
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/v1/workflows/tick")) {
+        const json = try ws.workflowTick();
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/workflows/") and !std.mem.eql(u8, path, "/v1/workflows/tick")) {
+        const name = path["/v1/workflows/".len..];
+        if (std.mem.indexOfScalar(u8, name, '/') == null and safe_name.isSafeName(name)) {
+            const json = ws.workflowShow(name) catch {
+                try respond(&request, &meta, "{\"error\":\"workflow_not_found\"}\n", .not_found, "application/json");
+                return;
+            };
+            defer allocator.free(json);
+            try respond(&request, &meta, json, .ok, "application/json");
+            return;
+        }
+    }
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflows/") and std.mem.endsWith(u8, path, "/runs")) {
+        const mid = path["/v1/workflows/".len .. path.len - "/runs".len];
+        if (!safe_name.isSafeName(mid)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_workflow_name\"}\n", .bad_request, "application/json");
+            return;
+        }
+        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(body);
+        var input_owned: ?[]u8 = null;
+        defer if (input_owned) |o| allocator.free(o);
+        var run_id_owned: ?[]u8 = null;
+        defer if (run_id_owned) |o| allocator.free(o);
+        var input: []const u8 = "{}";
+        var run_id: ?[]const u8 = null;
+        if (body.len > 0) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("input")) |inp| {
+                    var aw: std.Io.Writer.Allocating = .init(allocator);
+                    defer aw.deinit();
+                    try std.json.Stringify.value(inp, .{}, &aw.writer);
+                    input_owned = try allocator.dupe(u8, aw.written());
+                    input = input_owned.?;
+                }
+                if (parsed.value.object.get("run_id")) |r| {
+                    run_id_owned = try allocator.dupe(u8, r.string);
+                    run_id = run_id_owned;
+                }
+            }
+        }
+        const json = ws.workflowStart(mid, input, run_id) catch {
+            try respond(&request, &meta, "{\"error\":\"workflow_start_failed\"}\n", .bad_request, "application/json");
+            return;
+        };
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/workflow-runs")) {
+        const json = try ws.workflowListRuns();
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/workflow-runs/")) {
+        const rid = path["/v1/workflow-runs/".len..];
+        if (!safe_name.isSafeName(rid)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            return;
+        }
+        const json = ws.workflowStatus(rid) catch {
+            try respond(&request, &meta, "{\"error\":\"run_not_found\"}\n", .not_found, "application/json");
+            return;
+        };
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/signal")) {
+        const rid = path["/v1/workflow-runs/".len .. path.len - "/signal".len];
+        if (!safe_name.isSafeName(rid)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            return;
+        }
+        const body = readBody(allocator, &request, max_body) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respond(&request, &meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                return;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const typ_raw = parsed.value.object.get("type") orelse {
+            try respond(&request, &meta, "{\"error\":\"missing_type\"}\n", .bad_request, "application/json");
+            return;
+        };
+        const typ = try allocator.dupe(u8, typ_raw.string);
+        defer allocator.free(typ);
+        var payload_owned: ?[]u8 = null;
+        defer if (payload_owned) |p| allocator.free(p);
+        const payload: []const u8 = blk: {
+            if (parsed.value.object.get("payload")) |p| {
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                defer aw.deinit();
+                try std.json.Stringify.value(p, .{}, &aw.writer);
+                payload_owned = try allocator.dupe(u8, aw.written());
+                break :blk payload_owned.?;
+            }
+            break :blk "{}";
+        };
+        const json = ws.workflowSignal(rid, typ, payload) catch {
+            try respond(&request, &meta, "{\"error\":\"signal_failed\"}\n", .bad_request, "application/json");
+            return;
+        };
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/cancel")) {
+        const rid = path["/v1/workflow-runs/".len .. path.len - "/cancel".len];
+        if (!safe_name.isSafeName(rid)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            return;
+        }
+        const json = try ws.workflowCancel(rid);
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
+        return;
+    }
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/workflow-runs/") and std.mem.endsWith(u8, path, "/tick")) {
+        const rid = path["/v1/workflow-runs/".len .. path.len - "/tick".len];
+        if (!safe_name.isSafeName(rid)) {
+            try respond(&request, &meta, "{\"error\":\"invalid_run_id\"}\n", .bad_request, "application/json");
+            return;
+        }
+        const json = try ws.workflowTickRun(rid);
+        defer allocator.free(json);
+        try respond(&request, &meta, json, .ok, "application/json");
         return;
     }
 

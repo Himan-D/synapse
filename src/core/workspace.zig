@@ -7,6 +7,7 @@ const belief_mod = @import("belief.zig");
 const auth_mod = @import("auth.zig");
 const graph_mod = @import("graph.zig");
 const diff_mod = @import("diff.zig");
+const workflow_mod = @import("workflow.zig");
 
 pub const Workspace = struct {
     allocator: Allocator,
@@ -332,6 +333,112 @@ pub const Workspace = struct {
         return diff_mod.saveCheckpoint(self.allocator, self.io, &self.store, self.root, datasource, name);
     }
 
+    fn pipeActionExec(ctx: *anyopaque, pipe_name: []const u8, params_json: []const u8) anyerror![]u8 {
+        const self: *Workspace = @ptrCast(@alignCast(ctx));
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, params_json, .{});
+        defer parsed.deinit();
+        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer {
+            var it = params.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            params.deinit(self.allocator);
+        }
+        if (parsed.value == .object) {
+            var it = parsed.value.object.iterator();
+            while (it.next()) |e| {
+                const key = try self.allocator.dupe(u8, e.key_ptr.*);
+                const val = switch (e.value_ptr.*) {
+                    .string => |s| try self.allocator.dupe(u8, s),
+                    .integer => |i| try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
+                    .float => |f| try std.fmt.allocPrint(self.allocator, "{d}", .{f}),
+                    .bool => |b| try self.allocator.dupe(u8, if (b) "true" else "false"),
+                    else => try self.allocator.dupe(u8, ""),
+                };
+                try params.put(self.allocator, key, val);
+            }
+        }
+        const result = try self.runPipe(pipe_name, params);
+        return result.json;
+    }
+
+    fn actionCtx(self: *Workspace) workflow_mod.ActionExecCtx {
+        return .{ .ctx = self, .exec = pipeActionExec };
+    }
+
+    pub fn workflowList(self: *Workspace) ![]u8 {
+        return workflow_mod.listDefsJson(self.allocator, self.io, self.root);
+    }
+
+    pub fn workflowShow(self: *Workspace, name: []const u8) ![]u8 {
+        var def = try workflow_mod.loadDef(self.allocator, self.io, self.root, name);
+        defer def.deinit();
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        try aw.writer.print(
+            \\{{"name":{f},"version":{d},"steps":{d},"retry":{{"max_attempts":{d},"backoff_ms":{d}}}}}
+        ,
+            .{
+                std.json.fmt(def.name, .{}),
+                def.version,
+                def.steps.len,
+                def.retry.max_attempts,
+                def.retry.backoff_ms,
+            },
+        );
+        return try aw.toOwnedSlice();
+    }
+
+    pub fn workflowStart(self: *Workspace, name: []const u8, input_json: []const u8, run_id: ?[]const u8) ![]u8 {
+        var def = try workflow_mod.loadDef(self.allocator, self.io, self.root, name);
+        defer def.deinit();
+        const started = try workflow_mod.startRun(self.allocator, self.io, self.root, &def, input_json, run_id);
+        defer self.allocator.free(started);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, started, .{});
+        defer parsed.deinit();
+        const rid = try self.allocator.dupe(u8, parsed.value.object.get("run_id").?.string);
+        defer self.allocator.free(rid);
+        // Immediately tick so first noop/action progresses.
+        const ticked = try workflow_mod.tickRun(self.allocator, self.io, self.root, rid, self.actionCtx());
+        self.logOp("workflow_start", name, rid);
+        return ticked;
+    }
+
+    pub fn workflowStatus(self: *Workspace, run_id: []const u8) ![]u8 {
+        return workflow_mod.loadRunBytes(self.allocator, self.io, self.root, run_id);
+    }
+
+    pub fn workflowListRuns(self: *Workspace) ![]u8 {
+        return workflow_mod.listRunsJson(self.allocator, self.io, self.root);
+    }
+
+    pub fn workflowSignal(self: *Workspace, run_id: []const u8, event_type: []const u8, payload_json: []const u8) ![]u8 {
+        const out = try workflow_mod.signalRun(self.allocator, self.io, self.root, run_id, event_type, payload_json);
+        // After signal, continue ticking with pipe executor.
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, out, .{});
+        defer parsed.deinit();
+        const st = parsed.value.object.get("status").?.string;
+        if (std.mem.eql(u8, st, "running") or std.mem.eql(u8, st, "waiting")) {
+            self.allocator.free(out);
+            return try workflow_mod.tickRun(self.allocator, self.io, self.root, run_id, self.actionCtx());
+        }
+        return out;
+    }
+
+    pub fn workflowCancel(self: *Workspace, run_id: []const u8) ![]u8 {
+        return workflow_mod.cancelRun(self.allocator, self.io, self.root, run_id);
+    }
+
+    pub fn workflowTick(self: *Workspace) ![]u8 {
+        return workflow_mod.tickAll(self.allocator, self.io, self.root, self.actionCtx());
+    }
+
+    pub fn workflowTickRun(self: *Workspace, run_id: []const u8) ![]u8 {
+        return workflow_mod.tickRun(self.allocator, self.io, self.root, run_id, self.actionCtx());
+    }
+
     pub fn createBranch(self: *Workspace, name: []const u8) ![]u8 {
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const src = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/data", .{self.root});
@@ -392,6 +499,8 @@ pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []con
     try Io.Dir.cwd().createDirPath(io, data);
     const pipes = try std.fmt.bufPrint(&path_buf, "{s}/pipes", .{root});
     try Io.Dir.cwd().createDirPath(io, pipes);
+    const wfs = try std.fmt.bufPrint(&path_buf, "{s}/workflows", .{root});
+    try Io.Dir.cwd().createDirPath(io, wfs);
     const ds = try std.fmt.bufPrint(&path_buf, "{s}/datasources", .{root});
     try Io.Dir.cwd().createDirPath(io, ds);
 

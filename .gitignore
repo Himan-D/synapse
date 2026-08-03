@@ -18,3 +18,5 @@ sdk/typescript/dist/
 *.o
 *.obj
 .DS_Store
+.synapse/workflows/
+examples/**/.synapse/workflows/

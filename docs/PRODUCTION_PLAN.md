@@ -59,8 +59,11 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 - Kafka / ClickHouse / SQL pipes  
 - JWT / OAuth / rate-limit service mesh  
 - Horizontal scale / HA quorum  
-- Real webhook HTTP delivery (outbox remains local queue until Phase C)  
-- MCP Content-Length framing full stream mux  
+- Full Temporal feature parity (timers calendar, multi-worker, exactly-once fanout)  
+
+### Shipped since Phase B
+
+- Durable workflows (Temporal/Inngest-shaped): `workflows/*.workflow.json`, sleep / wait_event / signal / retry / tick — see `docs/WORKFLOWS.md`  
 
 ---
 

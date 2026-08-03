@@ -27,7 +27,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const root = flagOr(args, "--root", ".");
         var report = try validate_mod.buildWorkspace(allocator, io, root);
         defer report.deinit();
-        std.debug.print("{s}\n", .{report.json});
+        try printStdoutLine(io, report.json);
         if (!report.ok) return error.BuildFailed;
         return;
     }
@@ -37,7 +37,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         const json = try ws.listPipesJson(allocator);
         defer allocator.free(json);
-        std.debug.print("{s}\n", .{json});
+        try printStdoutLine(io, json);
         return;
     }
     if (std.mem.eql(u8, cmd, "endpoint") or std.mem.eql(u8, cmd, "endpoints")) {
@@ -46,7 +46,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         const json = try ws.listEndpointsJson(allocator);
         defer allocator.free(json);
-        std.debug.print("{s}\n", .{json});
+        try printStdoutLine(io, json);
         return;
     }
     if (std.mem.eql(u8, cmd, "token")) {
@@ -63,7 +63,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         if (std.mem.eql(u8, sub, "create")) {
             const json = try ws.createBranch(name);
             defer allocator.free(json);
-            std.debug.print("{s}\n", .{json});
+            try printStdoutLine(io, json);
             return;
         }
         return error.Usage;
@@ -75,7 +75,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         const json = try ws.graphJson(allocator, run_id);
         defer allocator.free(json);
-        std.debug.print("{s}\n", .{json});
+        try printStdoutLine(io, json);
         return;
     }
     if (std.mem.eql(u8, cmd, "checkpoint")) {
@@ -86,15 +86,87 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         const json = try ws.checkpoint(name, ds);
         defer allocator.free(json);
-        std.debug.print("{s}\n", .{json});
+        try printStdoutLine(io, json);
         return;
+    }
+    if (std.mem.eql(u8, cmd, "workflow")) {
+        if (args.len < 3) return error.Usage;
+        const sub = args[2];
+        const root = flagOr(args, "--root", ".");
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        if (std.mem.eql(u8, sub, "list")) {
+            const json = try ws.workflowList();
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "show")) {
+            if (args.len < 4) return error.Usage;
+            const json = try ws.workflowShow(args[3]);
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "start")) {
+            if (args.len < 4) return error.Usage;
+            const input = flagOr(args, "--input", "{}");
+            const rid = flagOr(args, "--run-id", "");
+            const json = try ws.workflowStart(args[3], input, if (rid.len > 0) rid else null);
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "status")) {
+            if (args.len < 4) return error.Usage;
+            const json = try ws.workflowStatus(args[3]);
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "runs")) {
+            const json = try ws.workflowListRuns();
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "signal")) {
+            if (args.len < 4) return error.Usage;
+            const typ = flagOr(args, "--type", "");
+            if (typ.len == 0) return error.Usage;
+            const payload = flagOr(args, "--payload", "{}");
+            const json = try ws.workflowSignal(args[3], typ, payload);
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "cancel")) {
+            if (args.len < 4) return error.Usage;
+            const json = try ws.workflowCancel(args[3]);
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "tick")) {
+            const rid = flagOr(args, "--run-id", "");
+            const json = if (rid.len > 0) try ws.workflowTickRun(rid) else try ws.workflowTick();
+            defer allocator.free(json);
+            try printStdoutLine(io, json);
+            return;
+        }
+        return error.Usage;
     }
     if (std.mem.eql(u8, cmd, "deploy")) {
         // Local-first stub: validate + report (cloud promotion is roadmap).
         const root = flagOr(args, "--root", ".");
         var report = try validate_mod.buildWorkspace(allocator, io, root);
         defer report.deinit();
-        std.debug.print("{{\"deploy\":\"local-validate\",\"report\":{s}}}\n", .{report.json});
+        {
+            var daw: std.Io.Writer.Allocating = .init(allocator);
+            defer daw.deinit();
+            try daw.writer.print("{{\"deploy\":\"local-validate\",\"report\":{s}}}", .{report.json});
+            try printStdoutLine(io, daw.written());
+        }
         if (!report.ok) return error.BuildFailed;
         return;
     }
@@ -148,7 +220,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         defer ws.deinit();
         const json = try ws.remember(run_id, agent_id, text, confidence);
         defer allocator.free(json);
-        std.debug.print("{s}\n", .{json});
+        try printStdoutLine(io, json);
         return;
     }
     if (std.mem.eql(u8, cmd, "test")) {
@@ -177,7 +249,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         }
         var result = try ws.runPipe(name, params);
         defer result.deinit();
-        std.debug.print("{s}\n", .{result.json});
+        try printStdoutLine(io, result.json);
         return;
     }
 
@@ -213,7 +285,7 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
             try aw.writer.writeAll("[]");
         }
         try aw.writer.writeAll("}\n");
-        std.debug.print("{s}", .{aw.written()});
+        try printStdoutLine(io, std.mem.trimEnd(u8, aw.written(), "\n"));
         return;
     }
 
@@ -259,11 +331,16 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const syn_dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse", .{root});
         try Io.Dir.cwd().createDirPath(io, syn_dir);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = tokens_path, .data = aw.written() });
-        std.debug.print("{{\"created\":true,\"name\":{f},\"token\":{f},\"scopes\":[{f}]}}\n", .{
-            std.json.fmt(name, .{}),
-            std.json.fmt(token, .{}),
-            std.json.fmt(scope, .{}),
-        });
+        {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try out.writer.print("{{\"created\":true,\"name\":{f},\"token\":{f},\"scopes\":[{f}]}}", .{
+                std.json.fmt(name, .{}),
+                std.json.fmt(token, .{}),
+                std.json.fmt(scope, .{}),
+            });
+            try printStdoutLine(io, out.written());
+        }
         return;
     }
 
@@ -337,6 +414,16 @@ fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void
     }
 }
 
+/// Machine-readable CLI output must go to stdout (not std.debug → stderr)
+/// so shells can capture/pipe it (`status=$(synapse …)`, `… | jq`).
+fn printStdoutLine(io: Io, line: []const u8) !void {
+    var buf: [64 * 1024]u8 = undefined;
+    var w = Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(line);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+}
+
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
     return false;
@@ -365,6 +452,7 @@ fn printHelp() !void {
         \\  synapse token show|create [name] --root <dir> [--scope SCOPE]
         \\  synapse branch create <name> --root <dir>
         \\  synapse checkpoint --name <id> --root <dir>
+        \\  synapse workflow list|show|start|status|runs|signal|cancel|tick ...
         \\  synapse graph --root <dir> --run-id <id>
         \\  synapse deploy --root <dir>
         \\  synapse mcp --root <dir>
