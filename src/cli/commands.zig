@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const workspace_mod = @import("../core/workspace.zig");
+const hub_mod = @import("../core/workspace_hub.zig");
+const platform_mod = @import("../core/platform.zig");
 const http_mod = @import("../server/http.zig");
 const validate_mod = @import("../core/validate.zig");
 const mcp_mod = @import("../server/mcp.zig");
@@ -32,12 +34,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "workspace")) {
-        const root = flagOr(args, "--root", ".");
-        var ws = try workspace_mod.Workspace.load(allocator, io, root);
-        defer ws.deinit();
-        const json = try ws.listPipesJson(allocator);
-        defer allocator.free(json);
-        try printStdoutLine(io, json);
+        try runWorkspaceCmd(allocator, io, args);
         return;
     }
     if (std.mem.eql(u8, cmd, "endpoint") or std.mem.eql(u8, cmd, "endpoints")) {
@@ -157,7 +154,6 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         return error.Usage;
     }
     if (std.mem.eql(u8, cmd, "deploy")) {
-        // Local-first stub: validate + report (cloud promotion is roadmap).
         const root = flagOr(args, "--root", ".");
         var report = try validate_mod.buildWorkspace(allocator, io, root);
         defer report.deinit();
@@ -190,6 +186,20 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         var ws = try workspace_mod.Workspace.load(allocator, io, root);
         defer ws.deinit();
         try http_mod.serve(allocator, io, &ws, .{ .host = host, .port = port });
+        return;
+    }
+    // ── Multi-workspace cloud serve ───────────────────────────────────────────
+    if (std.mem.eql(u8, cmd, "cloud")) {
+        try runCloud(allocator, io, args);
+        return;
+    }
+    // ── Platform management ───────────────────────────────────────────────────
+    if (std.mem.eql(u8, cmd, "platform")) {
+        try runPlatform(allocator, io, args);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "org")) {
+        try runOrg(allocator, io, args);
         return;
     }
     if (std.mem.eql(u8, cmd, "ingest")) {
@@ -258,9 +268,71 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
     return error.Usage;
 }
 
+// ── Workspace command (show pipes or create multi-workspace) ──────────────────
+
+fn runWorkspaceCmd(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    // Sub-commands for multi-workspace platform.
+    if (args.len >= 3 and std.mem.eql(u8, args[2], "create")) {
+        // synapse workspace create <name> --org <org_id> --data-root <dir>
+        if (args.len < 4) return error.Usage;
+        const name = args[3];
+        const org_id = flagOr(args, "--org", "");
+        if (org_id.len == 0) {
+            std.log.err("--org <org_id> required for workspace create", .{});
+            return error.Usage;
+        }
+        const data_root = dataRootFlag(args, io);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = store.createWorkspace(org_id, name) catch |err| switch (err) {
+            error.OrgNotFound => {
+                std.log.err("org '{s}' not found in platform store", .{org_id});
+                return error.OrgNotFound;
+            },
+            error.WorkspaceAlreadyExists => {
+                std.log.err("workspace already exists", .{});
+                return error.WorkspaceAlreadyExists;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+
+        // Scaffold the workspace directory.
+        var ws_parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer ws_parsed.deinit();
+        const ws_id = ws_parsed.value.object.get("workspace_id").?.string;
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const ws_root = try std.fmt.bufPrint(&path_buf, "{s}/workspaces/{s}", .{ data_root, ws_id });
+        workspace_mod.initWorkspace(allocator, io, ws_root, name) catch |err| {
+            std.log.warn("workspace scaffold failed: {s}", .{@errorName(err)});
+        };
+
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    // Default: list pipes for a single-workspace root.
+    const root = flagOr(args, "--root", ".");
+    var ws = try workspace_mod.Workspace.load(allocator, io, root);
+    defer ws.deinit();
+    const json = try ws.listPipesJson(allocator);
+    defer allocator.free(json);
+    try printStdoutLine(io, json);
+}
+
+// ── Token command ─────────────────────────────────────────────────────────────
+
 fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
     if (args.len < 3) return error.Usage;
     const sub = args[2];
+
+    // If --workspace flag present → platform-level token.
+    const ws_flag = flagOr(args, "--workspace", "");
+    if (ws_flag.len > 0) {
+        return runPlatformToken(allocator, io, args, sub, ws_flag);
+    }
+
+    // Legacy workspace-level token (in .synapse/tokens.json).
     const root = flagOr(args, "--root", ".");
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
@@ -300,7 +372,6 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
         const token = try std.fmt.allocPrint(allocator, "p.{s}", .{&hex});
         defer allocator.free(token);
 
-        // Load existing tokens array or start empty.
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
         try aw.writer.writeAll("[");
@@ -327,7 +398,6 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
         );
         try aw.writer.writeAll("]");
 
-        // ensure .synapse exists
         const syn_dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse", .{root});
         try Io.Dir.cwd().createDirPath(io, syn_dir);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = tokens_path, .data = aw.written() });
@@ -347,8 +417,169 @@ fn runToken(allocator: Allocator, io: Io, args: []const []const u8) !void {
     return error.Usage;
 }
 
+fn runPlatformToken(allocator: Allocator, io: Io, args: []const []const u8, sub: []const u8, workspace_id: []const u8) !void {
+    const data_root = dataRootFlag(args, io);
+    var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+    defer store.deinit();
+
+    if (std.mem.eql(u8, sub, "create")) {
+        const name = if (args.len >= 4) args[3] else "api";
+        const scope = flagOr(args, "--scope", "ADMIN");
+        const json = store.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+            error.WorkspaceNotFound => {
+                std.log.err("workspace '{s}' not found in platform store", .{workspace_id});
+                return error.WorkspaceNotFound;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "show")) {
+        // List platform tokens for this workspace.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("{\"tokens\":[");
+        var first = true;
+        for (store.tokens.items) |t| {
+            if (!std.mem.eql(u8, t.workspace_id, workspace_id)) continue;
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print("{{\"name\":{f},\"token\":{f},\"workspace_id\":{f}}}", .{
+                std.json.fmt(t.name, .{}),
+                std.json.fmt(t.token, .{}),
+                std.json.fmt(t.workspace_id, .{}),
+            });
+        }
+        try aw.writer.writeAll("]}");
+        try printStdoutLine(io, aw.written());
+        return;
+    }
+
+    return error.Usage;
+}
+
+// ── Platform command ──────────────────────────────────────────────────────────
+
+fn runPlatform(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("Usage: synapse platform <init|orgs|workspaces>\n", .{});
+        return error.Usage;
+    }
+    const sub = args[2];
+
+    if (std.mem.eql(u8, sub, "init")) {
+        const data_root = dataRootFlag(args, io);
+        const json = try platform_mod.PlatformStore.bootstrap(allocator, io, data_root);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "orgs")) {
+        const data_root = dataRootFlag(args, io);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = try store.listOrgsJson(allocator);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "workspaces")) {
+        const data_root = dataRootFlag(args, io);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = try store.listWorkspacesJson(allocator);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    std.log.err("unknown platform sub-command: {s}", .{sub});
+    return error.Usage;
+}
+
+// ── Org command ───────────────────────────────────────────────────────────────
+
+fn runOrg(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("Usage: synapse org create <name> --data-root <dir>\n", .{});
+        return error.Usage;
+    }
+    const sub = args[2];
+
+    if (std.mem.eql(u8, sub, "create")) {
+        if (args.len < 4) return error.Usage;
+        const name = args[3];
+        const data_root = dataRootFlag(args, io);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = store.createOrg(name) catch |err| switch (err) {
+            error.OrgAlreadyExists => {
+                std.log.err("org already exists", .{});
+                return error.OrgAlreadyExists;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const data_root = dataRootFlag(args, io);
+        var store = try platform_mod.PlatformStore.init(allocator, io, data_root);
+        defer store.deinit();
+        const json = try store.listOrgsJson(allocator);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    std.log.err("unknown org sub-command: {s}", .{sub});
+    return error.Usage;
+}
+
+// ── Cloud serve command ───────────────────────────────────────────────────────
+
+fn runCloud(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("Usage: synapse cloud serve --data-root <dir> [--host 0.0.0.0] [--port 8787]\n", .{});
+        return error.Usage;
+    }
+    const sub = args[2];
+    if (!std.mem.eql(u8, sub, "serve")) {
+        std.log.err("unknown cloud sub-command: {s}", .{sub});
+        return error.Usage;
+    }
+
+    const data_root = dataRootFlag(args, io);
+    const port_s = flagOr(args, "--port", portEnvOr("8787"));
+    const port = try std.fmt.parseInt(u16, port_s, 10);
+    const host_flag = flagOr(args, "--host", "");
+    const host: []const u8 = blk: {
+        if (host_flag.len > 0) break :blk host_flag;
+        if (std.c.getenv("SYNAPSE_HOST")) |v| break :blk std.mem.span(v);
+        break :blk "0.0.0.0";
+    };
+
+    var hub = try hub_mod.WorkspaceHub.init(allocator, io, data_root);
+    defer hub.deinit();
+
+    std.log.info("synapse cloud serve data_root={s} workspaces={d}", .{
+        data_root,
+        hub.platform.workspaces.items.len,
+    });
+
+    try http_mod.serveCloud(allocator, io, &hub, .{ .host = host, .port = port });
+}
+
+// ── MCP stdio ────────────────────────────────────────────────────────────────
+
 fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void {
-    // Supports MCP Content-Length framing and NDJSON line-delimited fallback.
     var stdin_buf: [64 * 1024]u8 = undefined;
     var stdout_buf: [64 * 1024]u8 = undefined;
     var in_reader = Io.File.stdin().reader(io, &stdin_buf);
@@ -361,7 +592,6 @@ fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void
             else => |e| return e,
         };
         if (first == '{') {
-            // NDJSON: rest of line is JSON body after leading '{'
             const rest = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => |e| return e,
@@ -378,7 +608,6 @@ fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void
             continue;
         }
 
-        // Content-Length framed: accumulate headers until blank line.
         var header_aw: std.Io.Writer.Allocating = .init(allocator);
         defer header_aw.deinit();
         try header_aw.writer.writeByte(first);
@@ -414,65 +643,7 @@ fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void
     }
 }
 
-/// Machine-readable CLI output must go to stdout (not std.debug → stderr)
-/// so shells can capture/pipe it (`status=$(synapse …)`, `… | jq`).
-fn printStdoutLine(io: Io, line: []const u8) !void {
-    var buf: [64 * 1024]u8 = undefined;
-    var w = Io.File.stdout().writer(io, &buf);
-    try w.interface.writeAll(line);
-    try w.interface.writeAll("\n");
-    try w.interface.flush();
-}
-
-fn hasFlag(args: []const []const u8, flag: []const u8) bool {
-    for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
-    return false;
-}
-
-fn flagOr(args: []const []const u8, flag: []const u8, default: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], flag) and i + 1 < args.len) return args[i + 1];
-        if (args[i].len > flag.len + 1 and std.mem.startsWith(u8, args[i], flag) and args[i][flag.len] == '=') {
-            return args[i][flag.len + 1 ..];
-        }
-    }
-    return default;
-}
-
-fn printHelp() !void {
-    const help =
-        \\synapse — Tinybird for AI harnesses
-        \\
-        \\Usage:
-        \\  synapse init [dir] [name]
-        \\  synapse build --root <dir>
-        \\  synapse workspace --root <dir>
-        \\  synapse endpoint --root <dir>
-        \\  synapse token show|create [name] --root <dir> [--scope SCOPE]
-        \\  synapse branch create <name> --root <dir>
-        \\  synapse checkpoint --name <id> --root <dir>
-        \\  synapse workflow list|show|start|status|runs|signal|cancel|tick ...
-        \\  synapse graph --root <dir> --run-id <id>
-        \\  synapse deploy --root <dir>
-        \\  synapse mcp --root <dir>
-        \\  synapse dev --root <dir> --port <port> [--host 127.0.0.1]
-        \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
-        \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
-        \\  synapse pipe run <name> --root <dir> [--run-id <id>] [k=v...]
-        \\  synapse test --root <dir>
-        \\
-        \\Env:
-        \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens
-        \\  SYNAPSE_HOST            bind address (default 127.0.0.1)
-        \\  SYNAPSE_RATE_LIMIT=N    token-bucket requests/sec (0=off)
-        \\
-        \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
-        \\See docs/PRODUCTION_PLAN.md, docs/openapi.yaml, and PRODUCT.md.
-        \\
-    ;
-    std.debug.print("{s}", .{help});
-}
+// ── Workspace tests ───────────────────────────────────────────────────────────
 
 fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
     var report = try validate_mod.buildWorkspace(allocator, io, root);
@@ -580,4 +751,87 @@ fn runWorkspaceTests(allocator: Allocator, io: Io, root: []const u8) !void {
     std.log.info("graph OK ({d} bytes)", .{gjson.len});
 
     std.log.info("all workspace tests passed", .{});
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn printStdoutLine(io: Io, line: []const u8) !void {
+    var buf: [64 * 1024]u8 = undefined;
+    var w = Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(line);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+}
+
+fn hasFlag(args: []const []const u8, flag: []const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
+    return false;
+}
+
+fn flagOr(args: []const []const u8, flag: []const u8, default: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], flag) and i + 1 < args.len) return args[i + 1];
+        if (args[i].len > flag.len + 1 and std.mem.startsWith(u8, args[i], flag) and args[i][flag.len] == '=') {
+            return args[i][flag.len + 1 ..];
+        }
+    }
+    return default;
+}
+
+/// Resolve --data-root flag, then SYNAPSE_DATA_ROOT env var, then ".".
+fn dataRootFlag(args: []const []const u8, io: Io) []const u8 {
+    _ = io;
+    const flag = flagOr(args, "--data-root", "");
+    if (flag.len > 0) return flag;
+    if (std.c.getenv("SYNAPSE_DATA_ROOT")) |v| return std.mem.span(v);
+    return ".";
+}
+
+fn portEnvOr(default: []const u8) []const u8 {
+    if (std.c.getenv("PORT")) |v| return std.mem.span(v);
+    return default;
+}
+
+fn printHelp() !void {
+    const help =
+        \\synapse — Tinybird for AI harnesses
+        \\
+        \\Single-workspace (dev):
+        \\  synapse init [dir] [name]
+        \\  synapse build --root <dir>
+        \\  synapse workspace --root <dir>
+        \\  synapse endpoint --root <dir>
+        \\  synapse token show|create [name] --root <dir> [--scope SCOPE]
+        \\  synapse branch create <name> --root <dir>
+        \\  synapse checkpoint --name <id> --root <dir>
+        \\  synapse workflow list|show|start|status|runs|signal|cancel|tick ...
+        \\  synapse graph --root <dir> --run-id <id>
+        \\  synapse deploy --root <dir>
+        \\  synapse mcp --root <dir>
+        \\  synapse dev --root <dir> --port <port> [--host 127.0.0.1]
+        \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
+        \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
+        \\  synapse pipe run <name> --root <dir> [--run-id <id>] [k=v...]
+        \\  synapse test --root <dir>
+        \\
+        \\Multi-workspace (cloud):
+        \\  synapse platform init --data-root <dir>
+        \\  synapse org create <name> --data-root <dir>
+        \\  synapse workspace create <name> --org <org_id> --data-root <dir>
+        \\  synapse token create [name] --workspace <ws_id> --data-root <dir> [--scope SCOPE]
+        \\  synapse cloud serve --data-root <dir> [--host 0.0.0.0] [--port 8787]
+        \\
+        \\Env:
+        \\  SYNAPSE_REQUIRE_AUTH=1   enforce scoped Bearer tokens
+        \\  SYNAPSE_HOST            bind address (default 127.0.0.1 / 0.0.0.0 in cloud)
+        \\  SYNAPSE_RATE_LIMIT=N    token-bucket requests/sec (0=off)
+        \\  SYNAPSE_DATA_ROOT       data root for cloud mode
+        \\  PORT                    port for cloud mode (Render compatible)
+        \\
+        \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
+        \\See docs/CLOUD.md, docs/PRODUCTION_PLAN.md, docs/openapi.yaml.
+        \\
+    ;
+    std.debug.print("{s}", .{help});
 }
