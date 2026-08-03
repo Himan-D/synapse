@@ -13,11 +13,28 @@ See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md)
 ## Quickstart (< 2 minutes)
 
 ```bash
+./scripts/demo.sh
+```
+
+That single command: builds (if needed) → ingests sample events → starts the server → curls every
+endpoint with labelled output → prints the playground URL → keeps the server alive until `Ctrl-C`.
+
+```
+Open playground  →  http://127.0.0.1:8787/
+MCP endpoint     →  http://127.0.0.1:8787/v1/mcp
+API base         →  http://127.0.0.1:8787/v1/
+```
+
+Optional port override: `./scripts/demo.sh 9000`
+
+### Manual steps (same as the script)
+
+```bash
 zig build
 
-# use the example workspace
-./zig-out/bin/synapse ingest harness_events examples/harness/sample_events.ndjson --root examples/harness --replace
-./zig-out/bin/synapse test --root examples/harness
+# ingest sample events
+./zig-out/bin/synapse ingest harness_events examples/harness/sample_events.ndjson \
+  --root examples/harness --replace
 
 # serve HTTP + MCP + playground UI
 ./zig-out/bin/synapse dev --root examples/harness --port 8787
@@ -28,19 +45,16 @@ In another terminal:
 
 ```bash
 curl -s 'http://127.0.0.1:8787/health'
-curl -s 'http://127.0.0.1:8787/v1/workspace'
 curl -s 'http://127.0.0.1:8787/v1/recall?run_id=run_demo&query=risk'
 curl -s 'http://127.0.0.1:8787/v1/plan?goal=fix%20risk%20bug&run_id=run_demo'
 curl -s 'http://127.0.0.1:8787/v1/route?query=run%20tests&run_id=run_demo'
-curl -s 'http://127.0.0.1:8787/v1/dispute?run_id=run_demo'
 curl -s 'http://127.0.0.1:8787/v1/metrics/tool_failure_rate?run_id=run_demo'
-curl -s 'http://127.0.0.1:8787/v1/impact?run_id=run_demo'
 curl -s -X POST 'http://127.0.0.1:8787/v1/remember' \
   -H 'content-type: application/json' \
   -d '{"run_id":"run_demo","text":"margin risk is elevated","confidence":0.9}'
 ```
 
-Or run the bundled script:
+### CI / full e2e (includes auth, schema-reject, workflow tests)
 
 ```bash
 ./scripts/e2e.sh
