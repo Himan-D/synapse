@@ -18,6 +18,18 @@ pub const Scope = enum {
         if (std.mem.eql(u8, s, "QUERY:READ") or std.mem.eql(u8, s, "query_read")) return .query_read;
         return null;
     }
+
+    /// Canonical wire representation (uppercase, colon-delimited).
+    /// Round-trips through fromString.
+    pub fn toWire(s: Scope) []const u8 {
+        return switch (s) {
+            .admin => "ADMIN",
+            .pipes_read => "PIPES:READ",
+            .events_write => "EVENTS:WRITE",
+            .remember_write => "REMEMBER:WRITE",
+            .query_read => "QUERY:READ",
+        };
+    }
 };
 
 pub const TokenEntry = struct {
@@ -157,6 +169,16 @@ pub const Auth = struct {
         return false;
     }
 };
+
+test "Scope.toWire round-trips through fromString" {
+    const scopes = [_]Scope{ .admin, .pipes_read, .events_write, .remember_write, .query_read };
+    for (scopes) |s| {
+        const wire = s.toWire();
+        const back = Scope.fromString(wire);
+        try std.testing.expect(back != null);
+        try std.testing.expectEqual(s, back.?);
+    }
+}
 
 test "requiredScope matrix" {
     try std.testing.expect(Auth.requiredScope(.GET, "/health") == null);

@@ -7,6 +7,15 @@ const workspace_mod = @import("workspace.zig");
 const platform_mod = @import("platform.zig");
 const auth_mod = @import("auth.zig");
 
+/// Result of an authorization check.
+pub const AuthResult = enum {
+    ok,
+    /// No token presented, or the token is unknown to the platform store.
+    unauthorized,
+    /// Token is valid but bound to a different workspace or has insufficient scope.
+    forbidden,
+};
+
 pub const WorkspaceHub = struct {
     allocator: Allocator,
     io: Io,
@@ -68,7 +77,7 @@ pub const WorkspaceHub = struct {
     }
 
     /// Scaffold a workspace directory and register in platform store.
-    /// Called from CLI `workspace create` after the platform entry is written.
+    /// Cloud scaffolding skips writing a local token; auth is handled by the platform store.
     pub fn scaffoldWorkspace(
         self: *WorkspaceHub,
         workspace_id: []const u8,
@@ -79,34 +88,47 @@ pub const WorkspaceHub = struct {
             self.data_root,
             workspace_id,
         });
-        try workspace_mod.initWorkspace(self.allocator, self.io, ws_root, name);
+        try workspace_mod.initWorkspace(self.allocator, self.io, ws_root, name, .{ .write_local_token = false });
     }
 
     // ── Auth helpers ─────────────────────────────────────────────────────────
 
-    /// Authorize a request for a specific workspace.
-    /// Checks the workspace's own token store first, then platform tokens.
+    /// Authorize a request for a specific workspace using the platform token store only.
+    ///
+    /// Returns:
+    ///   .ok         — token is valid and authorized for this workspace+scope
+    ///   .unauthorized — no token, or token is unknown to the platform
+    ///   .forbidden  — token is known but bound to a different workspace or wrong scope
+    ///
+    /// The workspace's own `.synapse/token` file is intentionally NOT checked here;
+    /// cloud routing must go through the platform store exclusively.
     pub fn authorizeForWorkspace(
         self: *WorkspaceHub,
-        ws: *workspace_mod.Workspace,
         workspace_id: []const u8,
         head_buffer: []const u8,
         method: std.http.Method,
         path: []const u8,
-    ) bool {
-        // Workspace-level auth (own tokens + admin token in .synapse/token).
-        if (ws.authorize(head_buffer, method, path)) return true;
+    ) AuthResult {
+        const need = auth_mod.Auth.requiredScope(method, path) orelse return .ok;
+        const presented = auth_mod.Auth.extractPresentedToken(head_buffer) orelse return .unauthorized;
 
-        // Platform-level token check.
-        const need = auth_mod.Auth.requiredScope(method, path) orelse return true;
-        const presented = auth_mod.Auth.extractPresentedToken(head_buffer) orelse return false;
-        return self.platform.authorizeWorkspaceToken(presented, workspace_id, need);
+        if (self.platform.isAdminToken(presented)) return .ok;
+
+        // Resolve which workspace this token is bound to.
+        const token_ws = self.platform.resolveWorkspaceId(presented);
+        if (token_ws == null) return .unauthorized; // unknown token
+
+        // Token is valid but bound to the wrong workspace.
+        if (!std.mem.eql(u8, token_ws.?, workspace_id)) return .forbidden;
+
+        // Right workspace — check scope.
+        return if (self.platform.authorizeWorkspaceToken(presented, workspace_id, need)) .ok else .forbidden;
     }
 
-    /// Returns true if the presented token is the platform admin token.
-    pub fn isAdminRequest(self: *WorkspaceHub, head_buffer: []const u8) bool {
-        const tok = auth_mod.Auth.extractPresentedToken(head_buffer) orelse return false;
-        return self.platform.isAdminToken(tok);
+    /// Authorize an admin-only control-plane request.
+    pub fn adminAuth(self: *WorkspaceHub, head_buffer: []const u8) AuthResult {
+        const tok = auth_mod.Auth.extractPresentedToken(head_buffer) orelse return .unauthorized;
+        return if (self.platform.isAdminToken(tok)) .ok else .forbidden;
     }
 
     // ── Workflow tick ─────────────────────────────────────────────────────────
@@ -142,4 +164,46 @@ test "hub get unknown workspace" {
 
     const ws = try hub.get("nonexistent_ws");
     try std.testing.expect(ws == null);
+}
+
+test "authorizeForWorkspace: 401 vs 403 distinction" {
+    const gpa = std.testing.allocator;
+    var hub: WorkspaceHub = .{
+        .allocator = gpa,
+        .io = undefined,
+        .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
+        .platform = .{
+            .allocator = gpa,
+            .io = undefined,
+            .data_root = try gpa.dupe(u8, "/tmp/hub_auth_test"),
+        },
+    };
+    defer hub.deinit();
+
+    hub.platform.admin_token = try gpa.dupe(u8, "sk.admintoken");
+
+    const scopes = try gpa.dupe(auth_mod.Scope, &[_]auth_mod.Scope{.admin});
+    try hub.platform.tokens.append(gpa, .{
+        .name = try gpa.dupe(u8, "tok_a"),
+        .token = try gpa.dupe(u8, "p.tokenA"),
+        .org_id = try gpa.dupe(u8, "org_1"),
+        .workspace_id = try gpa.dupe(u8, "ws_alpha"),
+        .scopes = scopes,
+    });
+
+    const head_no_token = "GET /v1/workspace HTTP/1.1\r\n\r\n";
+    const head_token_a = "GET /v1/workspace HTTP/1.1\r\nAuthorization: Bearer p.tokenA\r\n\r\n";
+    const head_unknown = "GET /v1/workspace HTTP/1.1\r\nAuthorization: Bearer p.unknown\r\n\r\n";
+    const head_admin = "GET /v1/workspace HTTP/1.1\r\nAuthorization: Bearer sk.admintoken\r\n\r\n";
+
+    // No token → 401
+    try std.testing.expectEqual(AuthResult.unauthorized, hub.authorizeForWorkspace("ws_alpha", head_no_token, .GET, "/v1/workspace"));
+    // Unknown token → 401
+    try std.testing.expectEqual(AuthResult.unauthorized, hub.authorizeForWorkspace("ws_alpha", head_unknown, .GET, "/v1/workspace"));
+    // Token for ws_alpha on ws_alpha → ok
+    try std.testing.expectEqual(AuthResult.ok, hub.authorizeForWorkspace("ws_alpha", head_token_a, .GET, "/v1/workspace"));
+    // Token for ws_alpha on ws_beta → 403
+    try std.testing.expectEqual(AuthResult.forbidden, hub.authorizeForWorkspace("ws_beta", head_token_a, .GET, "/v1/workspace"));
+    // Admin token on any workspace → ok
+    try std.testing.expectEqual(AuthResult.ok, hub.authorizeForWorkspace("ws_beta", head_admin, .GET, "/v1/workspace"));
 }

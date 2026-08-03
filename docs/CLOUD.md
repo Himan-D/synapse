@@ -1,7 +1,10 @@
 # Synapse Cloud — Deploy Guide
 
-> **Phase C** — multi-workspace cloud deploy on Render.  
-> See [PRODUCTION_PLAN.md](PRODUCTION_PLAN.md) for the full roadmap.
+> **Phase C — beta.** Multi-workspace cloud serving, the control plane, and the
+> CLI described here are implemented and covered by `scripts/e2e_cloud.sh`.
+> Beta means the HTTP contract is stable but has less production mileage than
+> local single-root mode. See [PRODUCTION_PLAN.md](PRODUCTION_PLAN.md) for what
+> is still open.
 
 ---
 
@@ -14,7 +17,8 @@
 5. [First-run bootstrap (platform init)](#5-first-run-bootstrap-platform-init)
 6. [Migrate from single-root local](#6-migrate-from-single-root-local)
 7. [Local Docker smoke test](#7-local-docker-smoke-test)
-8. [Storage seams (today → later)](#8-storage-seams-today--later)
+8. [Security model](#8-security-model)
+9. [Storage seams (today → later)](#9-storage-seams-today--later)
 
 ---
 
@@ -42,7 +46,7 @@ Platform catalog (orgs, workspaces, tokens) lives in `$SYNAPSE_DATA_ROOT/platfor
 
 | Mode | Path prefix | Auth token scope | Description |
 |---|---|---|---|
-| **Legacy / single-root** | `/v1/*` | workspace or admin | Default workspace (compat shim — same behavior as `synapse dev`) |
+| **Legacy / single-root** | `/v1/*` | token for the default workspace, or admin | Compat shim — same verbs as `synapse dev`. Requires a default workspace (see below), otherwise `404`. |
 | **Multi-workspace** | `/v1/w/{workspace_id}/*` | workspace-scoped token | All verbs scoped to one workspace |
 | **Control plane** | `/v1/platform/*` | admin token | Org/workspace/token management |
 | **Probes** | `/health`, `/ready` | none | Liveness + readiness |
@@ -67,19 +71,44 @@ POST /v1/w/acme-prod/mcp
 GET  /v1/w/acme-prod/pipes/{name}
 POST /v1/w/acme-prod/checkpoint
 
-# Control plane
+# Control plane — canonical (nested)
 GET  /v1/platform/orgs
 POST /v1/platform/orgs
 GET  /v1/platform/orgs/{org_id}/workspaces
 POST /v1/platform/orgs/{org_id}/workspaces
 POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
+
+# Control plane — flat aliases (still supported; prefer the nested routes above)
+GET  /v1/platform/workspaces
+POST /v1/platform/workspaces          # body carries org_id
+POST /v1/platform/tokens              # body carries workspace_id
 ```
 
+The nested routes are canonical because they validate the org→workspace
+relationship: minting a token under an `org_id` that does not own
+`{workspace_id}` returns `404`, so a stale or guessed workspace id cannot be
+attached to the wrong org.
+
 **Token scoping rules:**
-- An **admin token** may call any path.
-- A **workspace-scoped token** carries `workspace_id`; requests to `/v1/w/{id}/*` must match — mismatch → `403`.
-- A workspace token used on the legacy `/v1/*` path resolves to its bound workspace.
+- An **admin token** (`platform.json` → `admin_token`) may call any path, including the control plane.
+- A **workspace-scoped token** carries one scope and one `workspace_id`. Requests to `/v1/w/{id}/*` must match that id — mismatch → `403`.
+- Valid scopes: `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ`. Anything else is rejected at mint time with `400 unknown_scope`.
 - `SYNAPSE_REQUIRE_AUTH=1` is always set in the Docker image — `Authorization: Bearer <token>` or `?token=` required.
+
+### Default workspace for legacy `/v1/*`
+
+Bare `/v1/*` requests carry no workspace in the URL, so the server needs to be
+told which workspace they mean:
+
+```bash
+synapse cloud serve --data-root /data --workspace <workspace_id>
+# or
+SYNAPSE_WORKSPACE=<workspace_id> synapse cloud serve --data-root /data
+```
+
+The `--workspace` flag wins over `SYNAPSE_WORKSPACE`. With neither set, `/v1/*`
+returns `404` with a hint — it does not silently pick a workspace. Requests then
+still need a token valid for that workspace: a token bound elsewhere gets `403`.
 
 ---
 
@@ -132,12 +161,18 @@ synapse org create my-org --data-root /data
 synapse workspace create my-workspace --org <org_id> --data-root /data
 # → prints workspace_id
 
-# Mint an admin token for this workspace
-synapse token create admin --workspace <workspace_id> --data-root /data
-# → prints token (store it securely)
+# Mint a scoped token for this workspace
+synapse token create ingest --workspace <workspace_id> --scope EVENTS:WRITE --data-root /data
+# → prints token (store it securely; it is not recoverable from the server)
 ```
 
-> **Note:** The `synapse platform`, `synapse org`, `synapse workspace`, and `synapse token` CLI commands are part of Phase C implementation (todo: `cli-cloud`). If they are not yet shipped, use the control-plane HTTP API directly after first deploy (see §2 URL map).
+`synapse platform init` prints the platform `admin_token`. That token is the only
+credential that can reach `/v1/platform/*`, so capture it on first run.
+
+The running server watches `platform.json` and picks up orgs, workspaces, and
+tokens created by a separate CLI process on the next request — no restart or
+redeploy needed. Anything you can do with the CLI you can also do over the
+control-plane HTTP API with the admin token (see §2).
 
 ---
 
@@ -155,7 +190,14 @@ synapse token create admin --workspace <workspace_id> --data-root /data
 
 ## 5. First-run bootstrap (platform init)
 
-The platform catalog stores orgs, workspaces, and tokens in `$SYNAPSE_DATA_ROOT/platform.json`. This file is created by `synapse platform init`. On a fresh Render deploy with an empty disk, Synapse will emit a warning and refuse to serve workspace routes until initialized.
+The platform catalog stores orgs, workspaces, and tokens in `$SYNAPSE_DATA_ROOT/platform.json`. This file is created by `synapse platform init`.
+
+On a fresh Render deploy with an empty disk, `cloud serve` still starts and
+serves `/health` and `/ready` — so the Render health check passes — but logs a
+warning naming the missing file, and every workspace route returns `404` until a
+workspace exists. Because the server watches `platform.json`, running
+`platform init` from the Render shell takes effect on the next request; no
+redeploy is required.
 
 **Directory layout after init:**
 
@@ -179,46 +221,85 @@ Each workspace directory is structurally identical to a local `synapse dev --roo
 
 If you currently run `synapse dev --root ./my-workspace`, the legacy `/v1/*` paths continue to work when Synapse is started with a default workspace configured. To migrate to multi-tenant:
 
-### Step 1 — Copy local data to the Render disk
+### Step 1 — Register the workspace in the platform catalog
 
-```bash
-# Compress your local workspace
-tar czf workspace.tar.gz ./my-workspace
-
-# Upload to Render (use render shell or scp via SSH key)
-scp workspace.tar.gz <render-ssh-host>:/data/
-```
-
-### Step 2 — Register the workspace in the platform catalog
+Create the workspace first, because you need its generated `workspace_id` to know
+where to unpack your data.
 
 ```bash
 # On the Render shell:
 synapse platform init --data-root /data           # if not yet done
 synapse org create my-org --data-root /data
-synapse workspace create my-workspace --org <org_id> \
-  --data-root /data --import /data/workspace.tar.gz
-synapse token create admin --workspace <workspace_id> --data-root /data
+# → {"created":true,"org_id":"org_…","name":"my-org"}
+
+synapse workspace create my-workspace --org <org_id> --data-root /data
+# → {"created":true,"workspace_id":"ws_…","name":"my-workspace","org_id":"org_…"}
 ```
 
-### Step 3 — Update SDK / client base URL
+`workspace create` scaffolds `/data/workspaces/<workspace_id>/` with default
+datasources and pipes.
+
+### Step 2 — Copy local data over the scaffolded workspace
+
+There is no `--import` flag. A workspace is a plain directory, so copy the files
+directly — this is the whole migration.
+
+```bash
+# On your machine: pack the workspace contents (not the parent directory)
+tar czf workspace.tar.gz -C ./my-workspace .
+
+# Upload to Render (use render shell or scp via SSH key)
+scp workspace.tar.gz <render-ssh-host>:/tmp/
+
+# On the Render shell: unpack over the scaffolded workspace
+tar xzf /tmp/workspace.tar.gz -C /data/workspaces/<workspace_id>
+
+# Drop the local dev token — cloud mode ignores it, so leaving it is just a stale secret
+rm -f /data/workspaces/<workspace_id>/.synapse/token
+```
+
+Keep `workspace.json`, `datasources/`, `pipes/`, and `.synapse/data/*.ndjson`.
+The server reloads pipe definitions on mtime change, so pipes are live without a
+restart; already-loaded event data is re-read when the workspace is next opened.
+
+### Step 3 — Mint a token
+
+```bash
+synapse token create api --workspace <workspace_id> --scope ADMIN --data-root /data
+# → prints token; narrow the scope if the client only ingests or only reads
+```
+
+### Step 4 — Point your client at the deployment
+
+Today's Python and TypeScript SDKs take a base URL and a token only — neither
+has a `workspace_id` argument, and neither rewrites paths to `/v1/w/{id}/`. So
+there are two honest options.
+
+**Option A — keep the SDK unchanged (recommended for a migration window).**
+Serve the migrated workspace as the default and the existing `/v1/*` calls keep
+working against it:
+
+```bash
+synapse cloud serve --data-root /data --workspace <workspace_id>
+```
 
 ```python
-# Before (local):
-s = Synapse("http://127.0.0.1:8787")
+from synapse_sdk import Synapse
 
-# After (cloud, workspace-scoped):
-s = Synapse(
-    "https://synapse-xxxx.onrender.com",
-    workspace_id="<workspace_id>",
-    token="<token>",
-)
-# SDK prefixes /v1/w/{workspace_id}/ automatically (v0.2+)
-# or call /v1/w/{workspace_id}/recall etc. directly
+s = Synapse("https://synapse-xxxx.onrender.com", token="<token>")
+print(s.recall("run_demo", query="risk"))   # → GET /v1/recall
 ```
 
-### Backward-compat note
+**Option B — address workspaces explicitly.** Call the workspace-scoped paths
+directly. This is the only option if one process must serve several workspaces:
 
-The legacy `/v1/*` path remains available as long as Synapse has a default workspace configured (via `SYNAPSE_WORKSPACE` env var or `--workspace` flag to `cloud serve`). This allows existing integrations to continue working during a migration window.
+```bash
+curl -H "Authorization: Bearer <token>" \
+  "https://synapse-xxxx.onrender.com/v1/w/<workspace_id>/recall?run_id=run_demo&query=risk"
+```
+
+Multi-workspace support in the SDKs is not shipped. Until it is, Option B means
+constructing URLs yourself.
 
 ---
 
@@ -228,28 +309,83 @@ The legacy `/v1/*` path remains available as long as Synapse has a default works
 # Build
 docker build -t synapse:local .
 
-# Run (auth off for local testing only — never in production)
+# Bootstrap the catalog on the host before first run
+mkdir -p tmp-data
+./zig-out/bin/synapse platform init --data-root ./tmp-data   # prints admin_token
+
+# Run. The image binds 0.0.0.0 and sets SYNAPSE_REQUIRE_AUTH=1; cloud serve
+# refuses to start on a non-loopback address without it, so there is no
+# "auth off" container mode. Do not try to override it to 0 — the process exits.
 docker run --rm -p 8787:8787 \
-  -e SYNAPSE_REQUIRE_AUTH=0 \
   -e SYNAPSE_DATA_ROOT=/data \
   -v "$(pwd)/tmp-data:/data" \
   synapse:local
 
-# Probe
+# Probe — cloud mode reports mode:cloud so you can tell it apart from `synapse dev`
 curl http://localhost:8787/health
-# {"ok":true,"product":"synapse","version":"0.1.0"}
+# {"ok":true,"product":"synapse","version":"0.1.0","mode":"cloud"}
 
-# Test with auth (production-style)
-docker run --rm -p 8787:8787 \
-  -e SYNAPSE_REQUIRE_AUTH=1 \
-  -e SYNAPSE_DATA_ROOT=/data \
-  -v "$(pwd)/tmp-data:/data" \
-  synapse:local
+curl http://localhost:8787/ready
+# {"ready":true,"workspaces":0}
+
+# Control plane requires the admin token printed by `platform init`
+curl -H "Authorization: Bearer <admin_token>" http://localhost:8787/v1/platform/orgs
+```
+
+If you want an unauthenticated server for local poking, use single-root dev mode
+instead — it binds loopback by default:
+
+```bash
+synapse dev --root examples/harness --port 8787
 ```
 
 ---
 
-## 8. Storage seams (today → later)
+## 8. Security model
+
+**Two credential kinds.** The platform `admin_token` (prefix `sk.`) lives in
+`platform.json` and is the only credential accepted on `/v1/platform/*`.
+Workspace tokens (prefix `p.`) are bound to exactly one `workspace_id` and one
+scope. Tokens are stored as-is in `platform.json`, so that file is a secret:
+keep it on the persistent disk, never in the image or in git.
+
+**401 vs 403 is a real distinction, not a coin flip:**
+
+| Status | Meaning |
+|---|---|
+| `401 unauthorized` | No token presented, or the token is unknown to the platform catalog. |
+| `403 forbidden` | The token is genuine but not allowed here — bound to a different workspace, or lacking the scope this verb needs (e.g. a `PIPES:READ` token calling `POST /v1/events/...`). |
+| `404 not_found` | The org, workspace, run, or route does not exist — including a workspace that exists but is not owned by the `{org_id}` in the path. |
+
+Distinguishing them matters operationally: `401` means "fix your credential
+plumbing", `403` means "the credential works but was minted for something else".
+
+**Scope matrix.** `ADMIN` implies everything. `PIPES:READ` also satisfies
+`QUERY:READ`. Otherwise a token needs the exact scope for the verb:
+`EVENTS:WRITE` for ingest, `REMEMBER:WRITE` for remember/dispute,
+`QUERY:READ` for datasource reads, `ADMIN` for checkpoint/reload/MCP.
+
+**Local dev tokens are loopback-only.** `synapse init` writes a random
+per-workspace token to `.synapse/token` for single-root dev mode. That file is
+deliberately *not* consulted in cloud mode — `/v1/w/{id}/*` authorizes strictly
+against the platform catalog, so a leaked dev token cannot reach a cloud
+workspace. Cloud-scaffolded workspaces get no local token at all. Dev mode also
+leaves auth off unless `SYNAPSE_REQUIRE_AUTH=1`, which is safe only because it
+binds `127.0.0.1`; `cloud serve` refuses to bind any non-loopback address
+without auth enabled.
+
+**Not implemented, so do not assume it:** token revocation and rotation (delete
+the entry in `platform.json` and restart to revoke), token expiry, request
+signing, audit export, and TLS termination (terminate at Render or your load
+balancer — Synapse speaks plain HTTP).
+
+`scripts/e2e_cloud.sh` asserts the above end-to-end: no-token → 401, unknown
+token → 401, wrong-workspace token → 403, out-of-scope token → 403, cross-org
+mint → 404, and cross-workspace data isolation.
+
+---
+
+## 9. Storage seams (today → later)
 
 Synapse uses pluggable backends behind trait-like interfaces in Zig:
 

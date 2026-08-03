@@ -20,3 +20,6 @@ sdk/typescript/dist/
 .DS_Store
 .synapse/workflows/
 examples/**/.synapse/workflows/
+# e2e scratch dirs — normally removed on exit, but a crashed run can leak one
+tmp_e2e_cloud_*/
+platform.json

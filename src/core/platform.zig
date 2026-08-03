@@ -52,41 +52,16 @@ pub const PlatformStore = struct {
     }
 
     pub fn deinit(self: *PlatformStore) void {
-        if (self.admin_token) |t| self.allocator.free(t);
-        for (self.orgs.items) |o| {
-            self.allocator.free(o.id);
-            self.allocator.free(o.name);
-        }
+        self.clearAll();
         self.orgs.deinit(self.allocator);
-        for (self.workspaces.items) |w| {
-            self.allocator.free(w.id);
-            self.allocator.free(w.name);
-            self.allocator.free(w.org_id);
-        }
         self.workspaces.deinit(self.allocator);
-        for (self.tokens.items) |t| {
-            self.allocator.free(t.name);
-            self.allocator.free(t.token);
-            self.allocator.free(t.org_id);
-            self.allocator.free(t.workspace_id);
-            self.allocator.free(t.scopes);
-        }
         self.tokens.deinit(self.allocator);
         self.allocator.free(self.data_root);
         self.* = undefined;
     }
 
-    fn platformPath(self: *const PlatformStore, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/platform.json", .{self.data_root});
-    }
-
-    pub fn reload(self: *PlatformStore) !void {
-        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const path = try self.platformPath(&path_buf);
-        const bytes = try Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .unlimited);
-        defer self.allocator.free(bytes);
-
-        // Clear existing data before reloading.
+    /// Free every catalog entry, leaving the (still usable) lists empty.
+    fn clearAll(self: *PlatformStore) void {
         if (self.admin_token) |t| {
             self.allocator.free(t);
             self.admin_token = null;
@@ -110,51 +85,83 @@ pub const PlatformStore = struct {
             self.allocator.free(t.scopes);
         }
         self.tokens.clearRetainingCapacity();
+    }
+
+    fn platformPath(self: *const PlatformStore, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/platform.json", .{self.data_root});
+    }
+
+    /// Replace the in-memory catalog with the contents of {data_root}/platform.json.
+    ///
+    /// The file is read and parsed in full before any live state is dropped, so a
+    /// truncated or malformed file (for example a concurrent CLI write) returns an
+    /// error and leaves the current catalog serving requests untouched.
+    /// Entries missing required fields are skipped rather than aborting the load.
+    pub fn reload(self: *PlatformStore) !void {
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try self.platformPath(&path_buf);
+        const bytes = try Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .unlimited);
+        defer self.allocator.free(bytes);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPlatformFile;
         const root = parsed.value.object;
 
-        if (root.get("admin_token")) |at| {
-            if (at != .null) self.admin_token = try self.allocator.dupe(u8, at.string);
+        self.clearAll();
+
+        if (jsonString(root, "admin_token")) |at| {
+            self.admin_token = try self.allocator.dupe(u8, at);
         }
 
-        if (root.get("orgs")) |orgs_val| {
-            for (orgs_val.array.items) |item| {
+        if (jsonArray(root, "orgs")) |orgs_val| {
+            for (orgs_val) |item| {
+                if (item != .object) continue;
                 const o = item.object;
+                const id = jsonString(o, "id") orelse continue;
+                const name = jsonString(o, "name") orelse continue;
                 try self.orgs.append(self.allocator, .{
-                    .id = try self.allocator.dupe(u8, o.get("id").?.string),
-                    .name = try self.allocator.dupe(u8, o.get("name").?.string),
+                    .id = try self.allocator.dupe(u8, id),
+                    .name = try self.allocator.dupe(u8, name),
                 });
             }
         }
 
-        if (root.get("workspaces")) |wss| {
-            for (wss.array.items) |item| {
+        if (jsonArray(root, "workspaces")) |wss| {
+            for (wss) |item| {
+                if (item != .object) continue;
                 const w = item.object;
+                const id = jsonString(w, "id") orelse continue;
+                const name = jsonString(w, "name") orelse continue;
+                const org_id = jsonString(w, "org_id") orelse continue;
                 try self.workspaces.append(self.allocator, .{
-                    .id = try self.allocator.dupe(u8, w.get("id").?.string),
-                    .name = try self.allocator.dupe(u8, w.get("name").?.string),
-                    .org_id = try self.allocator.dupe(u8, w.get("org_id").?.string),
+                    .id = try self.allocator.dupe(u8, id),
+                    .name = try self.allocator.dupe(u8, name),
+                    .org_id = try self.allocator.dupe(u8, org_id),
                 });
             }
         }
 
-        if (root.get("tokens")) |toks| {
-            for (toks.array.items) |item| {
+        if (jsonArray(root, "tokens")) |toks| {
+            for (toks) |item| {
+                if (item != .object) continue;
                 const t = item.object;
+                const name = jsonString(t, "name") orelse continue;
+                const token = jsonString(t, "token") orelse continue;
                 var scopes: std.ArrayList(auth_mod.Scope) = .empty;
-                if (t.get("scopes")) |sc| {
-                    for (sc.array.items) |s| {
+                errdefer scopes.deinit(self.allocator);
+                if (jsonArray(t, "scopes")) |sc| {
+                    for (sc) |s| {
+                        if (s != .string) continue;
                         if (auth_mod.Scope.fromString(s.string)) |scope|
                             try scopes.append(self.allocator, scope);
                     }
                 }
                 try self.tokens.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, t.get("name").?.string),
-                    .token = try self.allocator.dupe(u8, t.get("token").?.string),
-                    .org_id = if (t.get("org_id")) |v| try self.allocator.dupe(u8, v.string) else try self.allocator.dupe(u8, ""),
-                    .workspace_id = if (t.get("workspace_id")) |v| try self.allocator.dupe(u8, v.string) else try self.allocator.dupe(u8, ""),
+                    .name = try self.allocator.dupe(u8, name),
+                    .token = try self.allocator.dupe(u8, token),
+                    .org_id = try self.allocator.dupe(u8, jsonString(t, "org_id") orelse ""),
+                    .workspace_id = try self.allocator.dupe(u8, jsonString(t, "workspace_id") orelse ""),
                     .scopes = try scopes.toOwnedSlice(self.allocator),
                 });
             }
@@ -201,7 +208,7 @@ pub const PlatformStore = struct {
             });
             for (t.scopes, 0..) |s, si| {
                 if (si > 0) try aw.writer.writeAll(",");
-                try aw.writer.print("{f}", .{std.json.fmt(@tagName(s), .{})});
+                try aw.writer.print("{f}", .{std.json.fmt(s.toWire(), .{})});
             }
             try aw.writer.writeAll("]}");
         }
@@ -257,7 +264,7 @@ pub const PlatformStore = struct {
 
     pub fn createOrg(self: *PlatformStore, name: []const u8) ![]u8 {
         var id_buf: [32]u8 = undefined;
-        const id = try std.fmt.bufPrint(&id_buf, "org_{s}", .{shortId(self.io, name)});
+        const id = try std.fmt.bufPrint(&id_buf, "org_{s}", .{shortId(self.io)});
         if (self.findOrg(id) != null) return error.OrgAlreadyExists;
         try self.orgs.append(self.allocator, .{
             .id = try self.allocator.dupe(u8, id),
@@ -296,7 +303,7 @@ pub const PlatformStore = struct {
     pub fn createWorkspace(self: *PlatformStore, org_id: []const u8, name: []const u8) ![]u8 {
         if (self.findOrg(org_id) == null) return error.OrgNotFound;
         var id_buf: [32]u8 = undefined;
-        const id = try std.fmt.bufPrint(&id_buf, "ws_{s}", .{shortId(self.io, name)});
+        const id = try std.fmt.bufPrint(&id_buf, "ws_{s}", .{shortId(self.io)});
         if (self.findWorkspace(id) != null) return error.WorkspaceAlreadyExists;
         try self.workspaces.append(self.allocator, .{
             .id = try self.allocator.dupe(u8, id),
@@ -336,13 +343,43 @@ pub const PlatformStore = struct {
         return try aw.toOwnedSlice();
     }
 
+    /// List workspaces belonging to a specific org.
+    /// Returns error.OrgNotFound if the org does not exist.
+    pub fn listWorkspacesForOrgJson(self: *const PlatformStore, allocator: Allocator, org_id: []const u8) ![]u8 {
+        if (self.findOrg(org_id) == null) return error.OrgNotFound;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.writeAll("{\"workspaces\":[");
+        var first = true;
+        for (self.workspaces.items) |w| {
+            if (!std.mem.eql(u8, w.org_id, org_id)) continue;
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print("{{\"id\":{f},\"name\":{f},\"org_id\":{f}}}", .{
+                std.json.fmt(w.id, .{}),
+                std.json.fmt(w.name, .{}),
+                std.json.fmt(w.org_id, .{}),
+            });
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
+    /// Returns true if workspace_id is registered and belongs to org_id.
+    pub fn orgOwnsWorkspace(self: *const PlatformStore, org_id: []const u8, workspace_id: []const u8) bool {
+        for (self.workspaces.items) |w| {
+            if (std.mem.eql(u8, w.id, workspace_id) and std.mem.eql(u8, w.org_id, org_id)) return true;
+        }
+        return false;
+    }
+
     // ── Token operations ────────────────────────────────────────────────────
 
     pub fn mintToken(self: *PlatformStore, workspace_id: []const u8, name: []const u8, scope_str: []const u8) ![]u8 {
         if (self.findWorkspace(workspace_id) == null) return error.WorkspaceNotFound;
+        const scope = auth_mod.Scope.fromString(scope_str) orelse return error.UnknownScope;
         var tok_buf: [40]u8 = undefined;
         const tok = generateToken(self.io, "p", &tok_buf);
-        const scope = auth_mod.Scope.fromString(scope_str) orelse .pipes_read;
 
         const org_id_owned: []const u8 = blk: {
             for (self.workspaces.items) |w| {
@@ -365,7 +402,7 @@ pub const PlatformStore = struct {
             std.json.fmt(name, .{}),
             std.json.fmt(tok, .{}),
             std.json.fmt(workspace_id, .{}),
-            std.json.fmt(scope_str, .{}),
+            std.json.fmt(scope.toWire(), .{}),
         });
     }
 
@@ -415,19 +452,36 @@ pub const PlatformStore = struct {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn shortId(io: Io, salt: []const u8) [8]u8 {
-    var rand_buf: [4]u8 = undefined;
-    const seed: u64 = @intCast(@max(Io.Clock.real.now(io).toSeconds(), 0));
-    var prng = std.Random.DefaultPrng.init(seed ^ @as(u64, @intCast(salt.len *% 2654435761)));
-    prng.random().bytes(&rand_buf);
+/// Read `key` from `obj` as a string, or null if absent/non-string/JSON null.
+fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Read `key` from `obj` as an array, or null if absent/non-array.
+fn jsonArray(obj: std.json.ObjectMap, key: []const u8) ?[]const std.json.Value {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .array => |a| a.items,
+        else => null,
+    };
+}
+
+/// 8-byte CSPRNG identifier → 16 lowercase hex chars.
+fn shortId(io: Io) [16]u8 {
+    var rand_buf: [8]u8 = undefined;
+    io.randomSecure(&rand_buf) catch io.random(&rand_buf);
     return std.fmt.bytesToHex(rand_buf, .lower);
 }
 
+/// CSPRNG token with a prefix: "prefix.{32 hex chars}".
+/// buf must be at least prefix.len + 1 + 32 bytes.
 fn generateToken(io: Io, prefix: []const u8, buf: []u8) []const u8 {
     var rand_buf: [16]u8 = undefined;
-    const seed: u64 = @intCast(@max(Io.Clock.real.now(io).toNanoseconds() >> 10, 0));
-    var prng = std.Random.DefaultPrng.init(seed ^ 0x9e3779b97f4a7c15);
-    prng.random().bytes(&rand_buf);
+    io.randomSecure(&rand_buf) catch io.random(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, &hex }) catch buf[0..0];
 }
@@ -482,4 +536,162 @@ test "authorizeWorkspaceToken isolation" {
     // Admin token can access any workspace.
     try std.testing.expect(store.authorizeWorkspaceToken("sk.admin", "ws_a", .pipes_read));
     try std.testing.expect(store.authorizeWorkspaceToken("sk.admin", "ws_b", .admin));
+}
+
+test "mintToken rejects unknown scope" {
+    const gpa = std.testing.allocator;
+    var store: PlatformStore = .{
+        .allocator = gpa,
+        .io = undefined,
+        .data_root = try gpa.dupe(u8, "/tmp/test"),
+    };
+    defer store.deinit();
+    try store.workspaces.append(gpa, .{
+        .id = try gpa.dupe(u8, "ws_1"),
+        .name = try gpa.dupe(u8, "test"),
+        .org_id = try gpa.dupe(u8, "org_1"),
+    });
+
+    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "INVALID_SCOPE"));
+    try std.testing.expectError(error.UnknownScope, store.mintToken("ws_1", "t", "MIND:READ"));
+}
+
+test "generateToken: 1000 tokens are all distinct" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = set.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        set.deinit(gpa);
+    }
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var buf: [40]u8 = undefined;
+        const tok = generateToken(io, "p", &buf);
+        const owned = try gpa.dupe(u8, tok);
+        const result = try set.getOrPut(gpa, owned);
+        if (result.found_existing) {
+            gpa.free(owned);
+            return error.TokenCollision;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1000), set.count());
+}
+
+test "shortId: 1000 ids are all distinct" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = set.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        set.deinit(gpa);
+    }
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const id = shortId(io);
+        const owned = try gpa.dupe(u8, &id);
+        const result = try set.getOrPut(gpa, owned);
+        if (result.found_existing) {
+            gpa.free(owned);
+            return error.ShortIdCollision;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1000), set.count());
+}
+
+test "scope toWire round-trips through save/reload" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const tmp = "/tmp/synapse_platform_roundtrip_test";
+
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var store: PlatformStore = .{
+        .allocator = gpa,
+        .io = io,
+        .data_root = try gpa.dupe(u8, tmp),
+    };
+
+    store.admin_token = try gpa.dupe(u8, "sk.testadmin");
+    try store.orgs.append(gpa, .{
+        .id = try gpa.dupe(u8, "org_rt"),
+        .name = try gpa.dupe(u8, "roundtrip"),
+    });
+    try store.workspaces.append(gpa, .{
+        .id = try gpa.dupe(u8, "ws_rt"),
+        .name = try gpa.dupe(u8, "rt"),
+        .org_id = try gpa.dupe(u8, "org_rt"),
+    });
+
+    const all_scopes = try gpa.dupe(auth_mod.Scope, &[_]auth_mod.Scope{
+        .admin, .pipes_read, .events_write, .remember_write, .query_read,
+    });
+    try store.tokens.append(gpa, .{
+        .name = try gpa.dupe(u8, "all_scopes"),
+        .token = try gpa.dupe(u8, "p.roundtrip"),
+        .org_id = try gpa.dupe(u8, "org_rt"),
+        .workspace_id = try gpa.dupe(u8, "ws_rt"),
+        .scopes = all_scopes,
+    });
+
+    try store.save();
+    try store.reload();
+
+    try std.testing.expectEqual(@as(usize, 1), store.tokens.items.len);
+    const loaded = store.tokens.items[0];
+    try std.testing.expectEqual(@as(usize, 5), loaded.scopes.len);
+    try std.testing.expectEqual(auth_mod.Scope.admin, loaded.scopes[0]);
+    try std.testing.expectEqual(auth_mod.Scope.pipes_read, loaded.scopes[1]);
+    try std.testing.expectEqual(auth_mod.Scope.events_write, loaded.scopes[2]);
+    try std.testing.expectEqual(auth_mod.Scope.remember_write, loaded.scopes[3]);
+    try std.testing.expectEqual(auth_mod.Scope.query_read, loaded.scopes[4]);
+
+    store.deinit();
+    Io.Dir.cwd().deleteFile(io, tmp ++ "/platform.json") catch {};
+}
+
+test "reload keeps the live catalog when platform.json is malformed" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const tmp = "/tmp/synapse_platform_torn_write_test";
+
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var store: PlatformStore = .{
+        .allocator = gpa,
+        .io = io,
+        .data_root = try gpa.dupe(u8, tmp),
+    };
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, tmp ++ "/platform.json") catch {};
+    }
+
+    store.admin_token = try gpa.dupe(u8, "sk.keepme");
+    try store.orgs.append(gpa, .{
+        .id = try gpa.dupe(u8, "org_keep"),
+        .name = try gpa.dupe(u8, "keep"),
+    });
+    try store.save();
+    try store.reload();
+    try std.testing.expectEqual(@as(usize, 1), store.orgs.items.len);
+
+    // Simulate a torn write from a concurrent CLI process.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = tmp ++ "/platform.json",
+        .data = "{\"version\":1,\"orgs\":[{\"id\":\"org_k",
+    });
+    if (store.reload()) |_| return error.ExpectedReloadFailure else |_| {}
+
+    // Previous catalog must still be intact and serving.
+    try std.testing.expectEqual(@as(usize, 1), store.orgs.items.len);
+    try std.testing.expectEqualStrings("org_keep", store.orgs.items[0].id);
+    try std.testing.expectEqualStrings("sk.keepme", store.admin_token.?);
+
+    // A non-object document is rejected without clobbering state either.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/platform.json", .data = "[]" });
+    try std.testing.expectError(error.InvalidPlatformFile, store.reload());
+    try std.testing.expectEqual(@as(usize, 1), store.orgs.items.len);
 }

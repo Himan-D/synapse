@@ -4,11 +4,22 @@
 
 > NetworkX computes on graphs. Neo4j stores graphs. Synapse runs agents on graphs.
 
-See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/WORKFLOWS.md](docs/WORKFLOWS.md), [docs/openapi.yaml](docs/openapi.yaml), [docs/architecture.md](docs/architecture.md), and **[docs/CLOUD.md](docs/CLOUD.md)** for Render/Docker cloud deploy.
+See [PRODUCT.md](PRODUCT.md), [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md), [docs/WORKFLOWS.md](docs/WORKFLOWS.md), [docs/openapi.yaml](docs/openapi.yaml), [docs/architecture.md](docs/architecture.md), [SECURITY.md](SECURITY.md), and **[docs/CLOUD.md](docs/CLOUD.md)** for Render/Docker cloud deploy.
+
+## Two ways to run it
+
+| Mode | Command | Status |
+|---|---|---|
+| **Local single-root** — one workspace per process | `synapse dev --root <dir>` | **Stable.** The recommended path. Start with `./scripts/demo.sh`. |
+| **Cloud multi-tenant** — many workspaces, orgs, scoped tokens | `synapse cloud serve` | **Phase C beta.** The HTTP contract is stable and workspace isolation is covered by `scripts/e2e_cloud.sh` in CI, but it has far less production mileage, and token revocation/expiry are not implemented. See [docs/CLOUD.md](docs/CLOUD.md). |
+
+Both modes read byte-identical workspace directories, so nothing you build
+locally has to be rewritten to move to cloud mode.
 
 ## Requirements
 
 - Zig 0.16+
+- `curl` and `python3` if you want to run the e2e scripts
 
 ## Quickstart (< 2 minutes)
 
@@ -57,7 +68,8 @@ curl -s -X POST 'http://127.0.0.1:8787/v1/remember' \
 ### CI / full e2e (includes auth, schema-reject, workflow tests)
 
 ```bash
-./scripts/e2e.sh
+./scripts/e2e.sh        # local single-root contract
+./scripts/e2e_cloud.sh  # multi-tenant routing, control plane, workspace isolation
 ```
 
 ## CLI
@@ -80,6 +92,16 @@ curl -s -X POST 'http://127.0.0.1:8787/v1/remember' \
 | `synapse pipe run <name> --root <dir> --run-id <id>` | Run a pipe offline |
 | `synapse test --root <dir>` | Verify build + verbs + copy/sink |
 
+Multi-workspace (cloud beta):
+
+| Command | Purpose |
+|---|---|
+| `synapse platform init --data-root <dir>` | Create the `platform.json` catalog + admin token |
+| `synapse org create <name> --data-root <dir>` | Create an org |
+| `synapse workspace create <name> --org <id> --data-root <dir>` | Scaffold a workspace under an org |
+| `synapse token create <name> --workspace <id> --scope <SCOPE> --data-root <dir>` | Mint a workspace-scoped token |
+| `synapse cloud serve --data-root <dir> [--workspace <id>]` | Serve every workspace from one process |
+
 ## Product surface
 
 ```
@@ -98,8 +120,8 @@ Default pipes:
 | `blast_radius` | `/v1/impact` | Work/World impact |
 | `find_contradictions` | `/v1/dispute` | Opposing Mind claims |
 
-Auth is opt-in: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`.  
-Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning).  
+Auth is opt-in in local mode: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`. Scopes are `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ` — that is the complete set. `401` means no or unknown token; `403` means a real token without the right scope. See [SECURITY.md](SECURITY.md).  
+Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning in `dev` and is refused outright by `cloud serve`).  
 Optional `SYNAPSE_RATE_LIMIT=<req/s>` token-bucket per token.  
 Bodies capped at 16 MiB; query `limit` clamped to 10_000. Every response includes `X-Request-Id`.  
 Probes: `GET /health` (liveness) · `GET /ready` (pipes loaded). Datasource schemas enforced on ingest.
@@ -133,7 +155,7 @@ print(s.plan("fix risk bug", run_id="run_demo"))
 s.remember("run_demo", "margin risk is elevated", confidence=0.9)
 ```
 
-## Cloud Deploy (Render)
+## Cloud Deploy (Render) — Phase C beta
 
 ```bash
 # Build image locally
@@ -143,15 +165,28 @@ docker build -t synapse:local .
 # render.yaml is at the repo root; see docs/CLOUD.md for full setup guide.
 ```
 
+The image runs `cloud serve` with `SYNAPSE_REQUIRE_AUTH=1`, so you need a
+`platform.json` catalog on a persistent disk before tokens will work — `docs/CLOUD.md`
+walks through bootstrapping it.
+
 See **[docs/CLOUD.md](docs/CLOUD.md)** for:
 - Render Blueprint deploy steps
 - URL map (`/v1/*` vs `/v1/w/{id}/*` vs `/v1/platform/*`)
 - Migration from single-root local
 - Environment variables reference
+- Security model (401 vs 403, scope matrix)
+
+Known beta gaps: no token revocation, rotation, or expiry (edit `platform.json`
+and restart); tokens carry exactly one scope; the Python and TypeScript SDKs do
+not build workspace-prefixed URLs for you.
 
 ## Develop
 
 ```bash
-zig build test
-zig build run -- test --root examples/harness
+zig fmt --check src/ build.zig
+zig build && zig build test
+./scripts/e2e.sh && ./scripts/e2e_cloud.sh
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — in particular the route → OpenAPI → e2e
+rule for any HTTP change.

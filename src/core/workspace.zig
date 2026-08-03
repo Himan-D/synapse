@@ -491,7 +491,13 @@ fn formatUtcNow(allocator: Allocator, io: Io) ![]u8 {
     );
 }
 
-pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []const u8) !void {
+pub const InitWorkspaceOptions = struct {
+    /// Write a local `.synapse/token` file for single-workspace dev mode.
+    /// Set to false when scaffolding for cloud (platform tokens are used instead).
+    write_local_token: bool = true,
+};
+
+pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []const u8, opts: InitWorkspaceOptions) !void {
     try Io.Dir.cwd().createDirPath(io, root);
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
 
@@ -518,9 +524,17 @@ pub fn initWorkspace(allocator: Allocator, io: Io, root: []const u8, name: []con
     const ws_path = try std.fmt.bufPrint(&path_buf, "{s}/workspace.json", .{root});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = ws_path, .data = ws_json.written() });
 
-    const token = "dev-token-local";
-    const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = token_path, .data = token });
+    if (opts.write_local_token) {
+        // Dev-only: write a local admin token so `synapse dev` works without platform setup.
+        // Cloud scaffolding skips this; auth is handled entirely by the platform store.
+        var tok_buf: [16]u8 = undefined;
+        io.randomSecure(&tok_buf) catch io.random(&tok_buf);
+        const tok_hex = std.fmt.bytesToHex(tok_buf, .lower);
+        var token_str: [38]u8 = undefined; // "local." (6) + 32 hex chars
+        const token = std.fmt.bufPrint(&token_str, "local.{s}", .{&tok_hex}) catch unreachable;
+        const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/token", .{root});
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = token_path, .data = token });
+    }
 
     try writeDefaultDatasources(io, root);
     try writeDefaultPipes(io, root);
@@ -542,7 +556,8 @@ fn writeDefaultDatasources(io: Io, root: []const u8) !void {
 
 fn writeDefaultPipes(io: Io, root: []const u8) !void {
     const files = [_]struct { []const u8, []const u8 }{
-        .{ "recall_context.pipe.json",
+        .{
+            "recall_context.pipe.json",
             \\{
             \\  "name": "recall_context",
             \\  "nodes": [
@@ -554,7 +569,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "tool_failure_rate.pipe.json",
+        .{
+            "tool_failure_rate.pipe.json",
             \\{
             \\  "name": "tool_failure_rate",
             \\  "nodes": [
@@ -565,7 +581,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "blast_radius.pipe.json",
+        .{
+            "blast_radius.pipe.json",
             \\{
             \\  "name": "blast_radius",
             \\  "nodes": [
@@ -577,7 +594,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "plan_goal.pipe.json",
+        .{
+            "plan_goal.pipe.json",
             \\{
             \\  "name": "plan_goal",
             \\  "nodes": [
@@ -589,7 +607,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "route_query.pipe.json",
+        .{
+            "route_query.pipe.json",
             \\{
             \\  "name": "route_query",
             \\  "nodes": [
@@ -601,7 +620,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "find_contradictions.pipe.json",
+        .{
+            "find_contradictions.pipe.json",
             \\{
             \\  "name": "find_contradictions",
             \\  "type": "endpoint",
@@ -614,7 +634,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "copy_tool_calls.pipe.json",
+        .{
+            "copy_tool_calls.pipe.json",
             \\{
             \\  "name": "copy_tool_calls",
             \\  "type": "copy",
@@ -627,7 +648,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "sink_metrics.pipe.json",
+        .{
+            "sink_metrics.pipe.json",
             \\{
             \\  "name": "sink_metrics",
             \\  "type": "sink",
@@ -641,7 +663,8 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
             \\}
             \\
         },
-        .{ "materialize_memory.pipe.json",
+        .{
+            "materialize_memory.pipe.json",
             \\{
             \\  "name": "materialize_memory",
             \\  "type": "materialized",

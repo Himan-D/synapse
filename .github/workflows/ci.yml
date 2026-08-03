@@ -6,20 +6,87 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   zig:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig 0.16
-        run: |
-          brew install zig
-          zig version
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fmt check
+        run: zig fmt --check src/ build.zig
+
       - name: Unit tests
         run: zig build test
+
       - name: Build
         run: zig build
-      - name: Workspace tests
-        run: ./zig-out/bin/synapse test --root examples/harness
+
+      - name: Make scripts executable
+        run: chmod +x scripts/e2e.sh scripts/e2e_cloud.sh
+
       - name: E2E
         run: ./scripts/e2e.sh
+
+      - name: E2E cloud
+        run: ./scripts/e2e_cloud.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t synapse:ci .
+
+      - name: Run container
+        run: |
+          docker run -d --name synapse-ci \
+            -e SYNAPSE_REQUIRE_AUTH=1 \
+            -e SYNAPSE_DATA_ROOT=/data \
+            -p 8787:8787 \
+            synapse:ci
+
+      - name: Health poll
+        run: |
+          healthy=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8787/health > /dev/null 2>&1; then
+              echo "healthy after $i attempts"
+              healthy=1
+              break
+            fi
+            echo "waiting ($i)..."
+            sleep 2
+          done
+          if [ "$healthy" != "1" ]; then
+            echo "FAIL: server never became healthy"
+            docker logs synapse-ci
+            exit 1
+          fi
+          curl -sf http://127.0.0.1:8787/health
+
+      - name: Unauthenticated /v1/platform/orgs returns 401
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8787/v1/platform/orgs)
+          if [ "$code" != "401" ]; then
+            echo "FAIL: expected 401 from /v1/platform/orgs, got $code"
+            docker logs synapse-ci
+            exit 1
+          fi
+          echo "ok: /v1/platform/orgs → 401"
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs synapse-ci

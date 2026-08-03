@@ -148,8 +148,17 @@ Every pipe can publish:
 - **Python SDK** — harness instrumentation + typed clients  
 - **TypeScript SDK** (roadmap) — web / Node harnesses  
 
-### 4.7 Cloud (roadmap)
-Managed ingest, storage, branching, multi-tenant tokens, hosted MCP — same workspace files, `synapse deploy`.
+### 4.7 Cloud (Phase C beta)
+`synapse cloud serve` hosts many workspaces from one process: orgs → workspaces →
+scoped tokens in a `platform.json` catalog, `/v1/w/{workspace_id}/*` routing, and
+an admin-only control plane at `/v1/platform/*`. Workspace directories are byte-
+for-byte the same as local ones, so the cloud layer is additive rather than a
+second API. Ships with a Dockerfile and a Render Blueprint — see
+[docs/CLOUD.md](docs/CLOUD.md).
+
+Beta, honestly: isolation and the auth matrix are tested end-to-end, but token
+revocation/rotation/expiry, multi-scope tokens, and multi-workspace SDK helpers
+are not implemented yet. Local single-root is still the stable path.
 
 ---
 
@@ -294,7 +303,13 @@ One write path → memory **and** metrics. No dual instrumentation.
 | Aggregate ops count / rate / sum · LLM token metrics | **Shipped** |
 | Webhook sink outbox · MCP stdio CLI | **Shipped** |
 | Datasource schema checks · GitHub CI · LICENSE | **Shipped** |
-| Cloud multi-tenant · SQL pipes · JWT · Kafka | Roadmap |
+| Durable workflows (sleep · wait_event · signal · retry) | **Shipped** — [docs/WORKFLOWS.md](docs/WORKFLOWS.md) |
+| Cloud multi-tenant (orgs · workspaces · scoped tokens · `cloud serve`) | **Beta** — [docs/CLOUD.md](docs/CLOUD.md); isolation covered by `scripts/e2e_cloud.sh` |
+| Docker image · Render Blueprint | **Shipped** |
+| Webhook retry/backoff drain worker · HTTPS webhook delivery | Roadmap |
+| Token revocation/rotation · expiry · multi-scope tokens | Roadmap |
+| Multi-workspace SDK support (Python/TS take `base_url` + `token` only) | Roadmap |
+| SQL pipes · JWT · Kafka | Roadmap |
 | Hypergraphs · CRDT merge · GNN | Research |
 
 ---
@@ -315,7 +330,8 @@ One write path → memory **and** metrics. No dual instrumentation.
 - Web UI: explore graph + pipe playground  
 
 ### Later
-- Synapse Cloud (hosted ingest + MCP)  
+- Synapse Cloud hardening: token revocation/rotation/expiry, multi-scope tokens, workspace delete  
+- Multi-workspace SDK clients (`/v1/w/{id}/*` without hand-built URLs)  
 - SQL pipe dialect (opt-in Tinybird parity)  
 - Multi-agent CRDT merge policies  
 - Regulated audit packs (trading / health)

@@ -17,6 +17,9 @@ pub const ServeConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8787,
     max_body_bytes: usize = max_body_bytes,
+    /// Default workspace id for legacy /v1/* routing in cloud mode.
+    /// If empty, falls back to SYNAPSE_WORKSPACE env var. If both are empty, /v1/* returns 404.
+    default_workspace_id: []const u8 = "",
 };
 
 var g_listen_fd: std.atomic.Value(std.posix.socket_t) = .init(-1);
@@ -79,6 +82,31 @@ fn pipesDirMtime(io: Io, root: []const u8) i128 {
         if (ns > newest) newest = ns;
     }
     return newest;
+}
+
+fn platformJsonMtime(io: Io, data_root: []const u8) i128 {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/platform.json", .{data_root}) catch return 0;
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    return st.mtime.toNanoseconds();
+}
+
+/// Pick up orgs/workspaces/tokens created by a separate `synapse` CLI process
+/// (or a previous run) without restarting the server. `last_mtime` is only
+/// advanced on a successful reload so a torn write is retried on the next accept.
+fn maybeReloadPlatform(io: Io, hub: *hub_mod.WorkspaceHub, last_mtime: *i128) void {
+    const m = platformJsonMtime(io, hub.data_root);
+    if (m == 0 or m <= last_mtime.*) return;
+    hub.platform.reload() catch |err| {
+        std.log.warn("platform.json reload failed, keeping previous catalog: {s}", .{@errorName(err)});
+        return;
+    };
+    last_mtime.* = m;
+    std.log.info("platform catalog reloaded: {d} orgs, {d} workspaces, {d} tokens", .{
+        hub.platform.orgs.items.len,
+        hub.platform.workspaces.items.len,
+        hub.platform.tokens.items.len,
+    });
 }
 
 fn maybeReloadPipes(io: Io, ws: *workspace_mod.Workspace, last_mtime: *i128) void {
@@ -159,7 +187,11 @@ pub fn serveCloud(allocator: Allocator, io: Io, hub: *hub_mod.WorkspaceHub, conf
     defer g_listen_fd.store(-1, .seq_cst);
 
     if (!isLoopbackHost(config.host) and !envTruthy("SYNAPSE_REQUIRE_AUTH")) {
-        std.log.warn("binding {s}:{d} without SYNAPSE_REQUIRE_AUTH=1 — tokens not enforced (cloud mode)", .{ config.host, config.port });
+        std.log.err(
+            "refusing to bind cloud server on {s}:{d}: SYNAPSE_REQUIRE_AUTH=1 is required for non-loopback addresses",
+            .{ config.host, config.port },
+        );
+        return error.RequireAuthNotSet;
     }
     std.log.info("synapse cloud listening on http://{s}:{d} version={s}", .{ config.host, config.port, version_mod.version });
 
@@ -170,6 +202,8 @@ pub fn serveCloud(allocator: Allocator, io: Io, hub: *hub_mod.WorkspaceHub, conf
         std.log.info("rate limit enabled: {d:.1} req/s", .{rate});
     }
     defer if (limiter) |*l| l.deinit();
+
+    var last_platform_mtime: i128 = platformJsonMtime(io, hub.data_root);
 
     while (!g_shutdown.load(.seq_cst)) {
         // Tick durable workflows across all loaded workspaces.
@@ -188,7 +222,11 @@ pub fn serveCloud(allocator: Allocator, io: Io, hub: *hub_mod.WorkspaceHub, conf
             }
         };
 
-        handleConnCloud(allocator, io, hub, &stream, config.max_body_bytes, if (limiter) |*l| l else null) catch |err| {
+        // Refresh the catalog after accept (not before) so the request we are about
+        // to serve sees orgs/workspaces/tokens created by a separate CLI process.
+        maybeReloadPlatform(io, hub, &last_platform_mtime);
+
+        handleConnCloud(allocator, io, hub, &stream, config.max_body_bytes, config.default_workspace_id, if (limiter) |*l| l else null) catch |err| {
             std.log.err("request failed: {s}", .{@errorName(err)});
         };
         stream.close(io);
@@ -260,8 +298,20 @@ fn respond(
     content_type: []const u8,
 ) !void {
     meta.status = @intFromEnum(status);
+
+    // std's keep-alive path asserts that a body-bearing method declared either
+    // Content-Length or Transfer-Encoding, because it wants to drain the body
+    // before reusing the connection. A client can legally send a bodyless POST
+    // (e.g. `curl -X POST` with no data), and we reject requests — rate limit,
+    // auth, invalid name — before reading any body. Closing the connection in
+    // that case keeps the assertion unreachable instead of aborting the server.
+    const body_undeclared = request.head.method.requestHasBody() and
+        request.head.transfer_encoding == .none and
+        request.head.content_length == null;
+
     try request.respond(body, .{
         .status = status,
+        .keep_alive = !body_undeclared,
         .extra_headers = &.{
             .{ .name = "content-type", .value = content_type },
             .{ .name = "x-request-id", .value = meta.id },
@@ -351,6 +401,7 @@ fn handleConnCloud(
     hub: *hub_mod.WorkspaceHub,
     stream: *Io.net.Stream,
     max_body: usize,
+    default_workspace_id: []const u8,
     limiter: ?*ratelimit_mod.Limiter,
 ) !void {
     var in_buf: [64 * 1024]u8 = undefined;
@@ -409,12 +460,20 @@ fn handleConnCloud(
 
     // Platform control plane: /v1/platform/*
     if (std.mem.startsWith(u8, path, "/v1/platform")) {
-        const require_auth = envTruthy("SYNAPSE_REQUIRE_AUTH");
-        if (require_auth and !hub.isAdminRequest(request.head_buffer)) {
-            try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
-            return;
+        if (envTruthy("SYNAPSE_REQUIRE_AUTH")) {
+            switch (hub.adminAuth(request.head_buffer)) {
+                .ok => {},
+                .unauthorized => {
+                    try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
+                    return;
+                },
+                .forbidden => {
+                    try respond(&request, &meta, "{\"error\":\"forbidden\"}\n", .forbidden, "application/json");
+                    return;
+                },
+            }
         }
-        try platformControlPlane(allocator, io, hub, &request, &meta, path, target, max_body);
+        try platformControlPlane(allocator, hub, &request, &meta, path, max_body);
         return;
     }
 
@@ -456,14 +515,63 @@ fn handleConnCloud(
         };
         defer allocator.free(rewritten_target);
 
-        // Auth: workspace tokens OR platform-scoped tokens.
-        const require_auth = envTruthy("SYNAPSE_REQUIRE_AUTH");
-        if (require_auth and !hub.authorizeForWorkspace(ws, workspace_id, request.head_buffer, method, rewritten_path)) {
-            try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
-            return;
+        // Auth: platform-scoped tokens only (no local .synapse/token fallback in cloud mode).
+        if (envTruthy("SYNAPSE_REQUIRE_AUTH")) {
+            switch (hub.authorizeForWorkspace(workspace_id, request.head_buffer, method, rewritten_path)) {
+                .ok => {},
+                .unauthorized => {
+                    try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
+                    return;
+                },
+                .forbidden => {
+                    try respond(&request, &meta, "{\"error\":\"forbidden\"}\n", .forbidden, "application/json");
+                    return;
+                },
+            }
         }
 
         try routeWorkspace(allocator, io, ws, &request, &meta, rewritten_path, rewritten_target, max_body);
+        return;
+    }
+
+    // Legacy /v1/* path via default workspace (--workspace flag or SYNAPSE_WORKSPACE env var).
+    if (std.mem.startsWith(u8, path, "/v1/")) {
+        const def_ws: []const u8 = blk: {
+            if (default_workspace_id.len > 0) break :blk default_workspace_id;
+            if (std.c.getenv("SYNAPSE_WORKSPACE")) |v| break :blk std.mem.span(v);
+            break :blk "";
+        };
+        if (def_ws.len == 0) {
+            try respond(&request, &meta,
+                \\{"error":"not_found","hint":"Use /v1/w/{workspace_id}/... or set SYNAPSE_WORKSPACE for legacy /v1/ routing"}
+                \\
+            , .not_found, "application/json");
+            return;
+        }
+        const ws = (hub.get(def_ws) catch |err| switch (err) {
+            error.FileNotFound => {
+                try respond(&request, &meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
+                return;
+            },
+            else => |e| return e,
+        }) orelse {
+            try respond(&request, &meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
+            return;
+        };
+        if (envTruthy("SYNAPSE_REQUIRE_AUTH")) {
+            switch (hub.authorizeForWorkspace(def_ws, request.head_buffer, method, path)) {
+                .ok => {},
+                .unauthorized => {
+                    try respond(&request, &meta, "{\"error\":\"unauthorized\"}\n", .unauthorized, "application/json");
+                    return;
+                },
+                .forbidden => {
+                    try respond(&request, &meta, "{\"error\":\"forbidden\"}\n", .forbidden, "application/json");
+                    return;
+                },
+            }
+        }
+        try routeWorkspace(allocator, io, ws, &request, &meta, path, target, max_body);
         return;
     }
 
@@ -477,17 +585,12 @@ fn handleConnCloud(
 
 fn platformControlPlane(
     allocator: Allocator,
-    io: Io,
     hub: *hub_mod.WorkspaceHub,
     request: *std.http.Server.Request,
     meta: *RequestMeta,
     path: []const u8,
-    _target: []const u8,
     max_body: usize,
 ) !void {
-    _ = io;
-    _ = _target;
-
     // GET /v1/platform/orgs
     if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/platform/orgs")) {
         const json = try hub.platform.listOrgsJson(allocator);
@@ -588,11 +691,122 @@ fn platformControlPlane(
                 try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .bad_request, "application/json");
                 return;
             },
+            error.UnknownScope => {
+                try respond(request, meta, "{\"error\":\"unknown_scope\"}\n", .bad_request, "application/json");
+                return;
+            },
             else => |e| return e,
         };
         defer allocator.free(json);
         try respond(request, meta, json, .ok, "application/json");
         return;
+    }
+
+    // ── Nested org routes ─────────────────────────────────────────────────────
+    // GET  /v1/platform/orgs/{org_id}/workspaces
+    // POST /v1/platform/orgs/{org_id}/workspaces
+    // POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
+    const orgs_nested_prefix = "/v1/platform/orgs/";
+    if (std.mem.startsWith(u8, path, orgs_nested_prefix) and path.len > orgs_nested_prefix.len) {
+        const after_orgs = path[orgs_nested_prefix.len..];
+        if (std.mem.indexOfScalar(u8, after_orgs, '/')) |slash| {
+            const org_id = after_orgs[0..slash];
+            const rest = after_orgs[slash..]; // starts with '/'
+
+            if (std.mem.eql(u8, rest, "/workspaces")) {
+                if (request.head.method == .GET) {
+                    const json = hub.platform.listWorkspacesForOrgJson(allocator, org_id) catch |err| switch (err) {
+                        error.OrgNotFound => {
+                            try respond(request, meta, "{\"error\":\"org_not_found\"}\n", .not_found, "application/json");
+                            return;
+                        },
+                        else => |e| return e,
+                    };
+                    defer allocator.free(json);
+                    try respond(request, meta, json, .ok, "application/json");
+                    return;
+                }
+                if (request.head.method == .POST) {
+                    const body = readBody(allocator, request, max_body) catch |err| switch (err) {
+                        error.StreamTooLong => {
+                            try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                            return;
+                        },
+                        else => |e| return e,
+                    };
+                    defer allocator.free(body);
+                    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+                    defer parsed.deinit();
+                    const name = parsed.value.object.get("name").?.string;
+                    const json = hub.platform.createWorkspace(org_id, name) catch |err| switch (err) {
+                        error.OrgNotFound => {
+                            try respond(request, meta, "{\"error\":\"org_not_found\"}\n", .not_found, "application/json");
+                            return;
+                        },
+                        error.WorkspaceAlreadyExists => {
+                            try respond(request, meta, "{\"error\":\"workspace_already_exists\"}\n", .conflict, "application/json");
+                            return;
+                        },
+                        else => |e| return e,
+                    };
+                    defer allocator.free(json);
+                    var ws_id_parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+                    defer ws_id_parsed.deinit();
+                    const ws_id = ws_id_parsed.value.object.get("workspace_id").?.string;
+                    hub.scaffoldWorkspace(ws_id, name) catch |err| {
+                        std.log.warn("workspace scaffold failed for {s}: {s}", .{ ws_id, @errorName(err) });
+                    };
+                    try respond(request, meta, json, .ok, "application/json");
+                    return;
+                }
+            }
+
+            // POST /v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens
+            const ws_prefix = "/workspaces/";
+            const tok_suffix = "/tokens";
+            if (request.head.method == .POST and
+                std.mem.startsWith(u8, rest, ws_prefix) and
+                std.mem.endsWith(u8, rest, tok_suffix) and
+                rest.len > ws_prefix.len + tok_suffix.len)
+            {
+                const ws_section = rest[ws_prefix.len .. rest.len - tok_suffix.len];
+                if (std.mem.indexOfScalar(u8, ws_section, '/') == null and ws_section.len > 0) {
+                    const workspace_id = ws_section;
+                    // Validate org owns this workspace (wrong org or missing → 404).
+                    if (!hub.platform.orgOwnsWorkspace(org_id, workspace_id)) {
+                        try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
+                        return;
+                    }
+                    const body = readBody(allocator, request, max_body) catch |err| switch (err) {
+                        error.StreamTooLong => {
+                            try respond(request, meta, "{\"error\":\"payload_too_large\"}\n", .payload_too_large, "application/json");
+                            return;
+                        },
+                        else => |e| return e,
+                    };
+                    defer allocator.free(body);
+                    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+                    defer parsed.deinit();
+                    const obj = parsed.value.object;
+                    const name = if (obj.get("name")) |v| v.string else "api";
+                    const scope = if (obj.get("scope")) |v| v.string else "ADMIN";
+                    const json = hub.platform.mintToken(workspace_id, name, scope) catch |err| switch (err) {
+                        error.WorkspaceNotFound => {
+                            try respond(request, meta, "{\"error\":\"workspace_not_found\"}\n", .not_found, "application/json");
+                            return;
+                        },
+                        error.UnknownScope => {
+                            try respond(request, meta, "{\"error\":\"unknown_scope\"}\n", .bad_request, "application/json");
+                            return;
+                        },
+                        else => |e| return e,
+                    };
+                    defer allocator.free(json);
+                    try respond(request, meta, json, .ok, "application/json");
+                    return;
+                }
+            }
+        }
     }
 
     try respond(request, meta, "{\"error\":\"not_found\"}\n", .not_found, "application/json");
@@ -613,7 +827,7 @@ fn routeWorkspace(
     const method = request.head.method;
 
     if (method == .GET and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/ui") or std.mem.eql(u8, path, "/ui/"))) {
-        const html = try loadUiHtml(allocator, io, ws.root);
+        const html = try loadUiHtml(allocator, io);
         defer allocator.free(html);
         try respond(request, meta, html, .ok, "text/html; charset=utf-8");
         return;
@@ -1166,8 +1380,7 @@ fn readBody(allocator: Allocator, request: *std.http.Server.Request, max_body: u
     };
 }
 
-fn loadUiHtml(allocator: Allocator, io: Io, workspace_root: []const u8) ![]u8 {
-    _ = workspace_root;
+fn loadUiHtml(allocator: Allocator, io: Io) ![]u8 {
     const candidates = [_][]const u8{ "web/index.html", "ui/index.html" };
     for (candidates) |p| {
         if (Io.Dir.cwd().readFileAlloc(io, p, allocator, .unlimited)) |bytes| return bytes else |_| {}

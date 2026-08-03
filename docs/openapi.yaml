@@ -9,12 +9,18 @@ info:
 
     | Mode | Prefix | Notes |
     |---|---|---|
-    | Legacy / single-root | `/v1/*` | Default workspace — same as `synapse dev`. All paths below apply. |
+    | Legacy / single-root | `/v1/*` | Default workspace — requires `SYNAPSE_WORKSPACE` env var or `--workspace` in `cloud serve`. Same paths as `synapse dev`. |
     | Multi-workspace | `/v1/w/{workspace_id}/*` | All verb paths under `/v1/` also exist under this prefix, scoped to a workspace. Token must match the workspace. |
-    | Control plane | `/v1/platform/*` | Admin-token only. Org/workspace/token management. |
+    | Control plane (canonical) | `/v1/platform/orgs/{org_id}/workspaces` | Admin-token only. Org-scoped workspace listing/creation. |
+    | Control plane (canonical) | `/v1/platform/orgs/{org_id}/workspaces/{workspace_id}/tokens` | Admin-token only. Token minting scoped to org→workspace. |
+    | Control plane (flat alias) | `/v1/platform/workspaces`, `/v1/platform/tokens` | Flat aliases for backwards compat. Prefer nested canonical routes. |
 
     For multi-workspace deployments, use `/v1/w/{workspace_id}/recall` etc.
     The control-plane endpoints (`/v1/platform/*`) are only available in `synapse cloud serve` mode.
+
+    ### Valid token scopes
+    `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ`.
+    `MIND:READ` and `MIND:WRITE` are **not** valid — the server rejects them with `400 unknown_scope`.
   version: 0.1.0
 servers:
   - url: http://127.0.0.1:8787
@@ -535,10 +541,15 @@ paths:
               required: [name]
               properties:
                 name: { type: string }
-                scopes:
-                  type: array
-                  items: { type: string, enum: [EVENTS:WRITE, PIPES:READ, MIND:READ, MIND:WRITE, ADMIN] }
-                  default: [EVENTS:WRITE, PIPES:READ, MIND:READ, MIND:WRITE]
+                scope:
+                  type: string
+                  enum: [ADMIN, PIPES:READ, EVENTS:WRITE, REMEMBER:WRITE, QUERY:READ]
+                  default: ADMIN
+                  description: |
+                    Single scope for the minted token.
+                    ADMIN — full access; PIPES:READ — read endpoints/pipes;
+                    EVENTS:WRITE — ingest only; REMEMBER:WRITE — remember/dispute;
+                    QUERY:READ — datasource query only.
       responses:
         "200":
           description: Minted token

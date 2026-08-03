@@ -55,7 +55,6 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 
 ### Explicitly out of scope (next phases)
 
-- Multi-tenant cloud control plane  
 - Kafka / ClickHouse / SQL pipes  
 - JWT / OAuth / rate-limit service mesh  
 - Horizontal scale / HA quorum  
@@ -64,6 +63,7 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 ### Shipped since Phase B
 
 - Durable workflows (Temporal/Inngest-shaped): `workflows/*.workflow.json`, sleep / wait_event / signal / retry / tick — see `docs/WORKFLOWS.md`  
+- Multi-tenant cloud control plane — moved out of "out of scope" and shipped as Phase C beta (see below)  
 
 ---
 
@@ -98,25 +98,35 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 
 ### Phase C — Platform / cloud beta
 
-**Status: in progress** — render-pack shipped; platform/http/cli implementation ongoing.
+**Status: beta shipped.** Multi-tenant serving, the control plane, and the cloud
+CLI are implemented and verified by `scripts/e2e_cloud.sh` in CI. Beta means the
+HTTP contract is stable and isolation is tested, but it has far less production
+mileage than local single-root mode, and the operational gaps listed below are
+real. Local single-root remains the recommended path for production use.
 
-#### Shipped (this pass)
+#### Shipped
 
 - [x] `Dockerfile` — Zig 0.16 multi-stage build; `synapse cloud serve`; binds `0.0.0.0:$PORT`; data at `/data`; `EXPOSE 8787`
 - [x] `render.yaml` — Render Blueprint: Web Service + persistent disk `/data`; `SYNAPSE_REQUIRE_AUTH=1`; optional `SYNAPSE_RATE_LIMIT`
-- [x] `docs/CLOUD.md` — Deploy guide: Render Blueprint, URL map, bootstrap, migration from single-root, storage seams
-- [x] `docs/openapi.yaml` — Platform control-plane routes + `/v1/w/{workspace_id}/*` workspace paths documented
-- [x] URL contract locked: `/v1/*` (legacy), `/v1/w/{workspace_id}/*` (multi), `/v1/platform/*` (control plane)
+- [x] `docs/CLOUD.md` — Deploy guide: Render Blueprint, URL map, bootstrap, migration from single-root, security model, storage seams
+- [x] `docs/openapi.yaml` — Control-plane routes + `/v1/w/{workspace_id}/*` workspace paths documented; scope enum matches `auth.zig`
+- [x] URL contract locked: `/v1/*` (legacy default workspace), `/v1/w/{workspace_id}/*` (multi), `/v1/platform/*` (control plane)
+- [x] `platform.zig` — org/workspace/token catalog in `platform.json`; CSPRNG ids and tokens; unknown scopes rejected at mint
+- [x] `workspace_hub.zig` — lazy multi-root workspace loading; platform-store-only auth with 401/403 separation
+- [x] HTTP routing — `/v1/w/{id}/*` prefix stripping + workspace resolver; nested canonical control-plane routes with org→workspace ownership checks (`404` on mismatch); flat aliases retained
+- [x] Legacy `/v1/*` default workspace via `--workspace` flag or `SYNAPSE_WORKSPACE` (no silent fallback — `404` when unset)
+- [x] `platform.json` mtime watch — CLI-created orgs/workspaces/tokens are served without a restart; torn writes keep the previous catalog
+- [x] CLI: `synapse platform init`, `org create`, `workspace create`, `token create`, `cloud serve`
+- [x] Isolation + auth-matrix e2e (`scripts/e2e_cloud.sh`): cross-workspace data isolation, no-token 401, unknown token 401, wrong-workspace 403, out-of-scope 403, cross-org mint 404, non-loopback without auth refuses to bind
 
-#### In progress
+#### Open in Phase C
 
-- [ ] `platform.zig` + `workspace_hub.zig` — org/workspace/token store + lazy multi-root (todo: platform-store)
-- [ ] HTTP routing — `/v1/w/{id}/*` prefix stripping + workspace resolver (todo: http-routing)
-- [ ] CLI: `synapse platform init`, `org create`, `workspace create`, `token create`, `cloud serve` (todo: cli-cloud)
-
-#### Pending (Phase C)
-
-- [ ] Isolation tests + multi-workspace e2e (todo: verify-multi)
+- [ ] Token revocation / rotation as a first-class operation (today: edit `platform.json`, restart)
+- [ ] Token expiry (`expires_at`) and `GET /v1/platform/.../tokens` listing over HTTP
+- [ ] Multi-scope tokens — a token carries exactly one scope today, so combined ingest+read clients need `ADMIN`
+- [ ] Atomic `platform.json` writes (write-temp + rename) — currently a plain overwrite
+- [ ] Workspace delete / archive
+- [ ] Multi-workspace support in the Python + TypeScript SDKs (they take `base_url` + `token` only; `/v1/w/{id}/*` must be constructed by hand)
 - [ ] Webhook retry/backoff drain worker (Phase B carry-over)
 - [ ] HTTPS webhook delivery (Phase B carry-over)
 
@@ -142,9 +152,9 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 **So that** a buggy agent cannot OOM the sidecar  
 
 **AC:**
-- [ ] Body > 16 MiB → HTTP 413 JSON error  
-- [ ] `limit` > 10000 clamped to 10000  
-- [ ] Documented in OpenAPI  
+- [x] Body > 16 MiB → HTTP 413 JSON error  
+- [x] `limit` > 10000 clamped to 10000  
+- [x] Documented in OpenAPI  
 
 ### US-A2: Operable process
 **As an** operator  
@@ -152,10 +162,10 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 **So that** I can debug and roll without orphan listeners  
 
 **AC:**
-- [ ] `GET /health` → `{ok, product, version, ready}`  
-- [ ] Response includes `X-Request-Id`  
-- [ ] Access log JSON: `ts,request_id,method,path,status,duration_ms`  
-- [ ] SIGINT stops accept loop after current request  
+- [x] `GET /health` → `{ok, product, version}` (liveness); readiness is a separate `GET /ready` → `{ready, pipes}`. Cloud mode adds `"mode":"cloud"` to `/health` and reports `{ready, workspaces}`.  
+- [x] Response includes `X-Request-Id`  
+- [x] Access log JSON: `ts,request_id,method,path,status,duration_ms`  
+- [x] SIGINT stops accept loop after current request  
 
 ### US-A3: Safe auth
 **As a** security-minded builder  
@@ -163,10 +173,10 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 **So that** a read token cannot ingest or checkpoint  
 
 **AC:**
-- [ ] `PIPES:READ` can recall/plan; cannot POST events  
-- [ ] `EVENTS:WRITE` can ingest; cannot checkpoint  
-- [ ] Admin token can do all  
-- [ ] `token=` query param works when Bearer absent  
+- [x] `PIPES:READ` can recall/plan; cannot POST events  
+- [x] `EVENTS:WRITE` can ingest; cannot checkpoint  
+- [x] Admin token can do all  
+- [x] `token=` query param works when Bearer absent  
 
 ### US-A4: Checkpoint integrity
 **As a** harness builder  
@@ -174,8 +184,8 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 **So that** agents cannot write outside `.synapse/checkpoints`  
 
 **AC:**
-- [ ] Names must match `[A-Za-z0-9_.-]{1,64}`  
-- [ ] Diff/checkpoint e2e passes  
+- [x] Names must match `[A-Za-z0-9_.-]{1,64}`  
+- [x] Diff/checkpoint e2e passes  
 
 ---
 
@@ -204,13 +214,14 @@ Cloud metrics (later): multi-tenant isolation, ingest QPS, pipe freshness SLO.
 
 ## 9. Launch checklist (local GA)
 
-- [ ] `zig build test` green in CI  
-- [ ] `scripts/e2e.sh` covers verbs + checkpoint + auth  
-- [ ] OpenAPI published under `docs/openapi.yaml`  
-- [ ] README links production plan + env vars  
-- [ ] Default bind loopback; non-loopback warns without auth  
-- [ ] LICENSE + CONTRIBUTING current  
-- [ ] Example harness demos all five verbs  
+- [x] `zig build test` green in CI  
+- [x] `scripts/e2e.sh` covers verbs + checkpoint + auth  
+- [x] `scripts/e2e_cloud.sh` covers multi-tenant isolation + auth matrix  
+- [x] OpenAPI published under `docs/openapi.yaml`  
+- [x] README links production plan + env vars  
+- [x] Default bind loopback; non-loopback warns without auth (dev) / refuses to bind (cloud)  
+- [x] LICENSE + CONTRIBUTING + SECURITY current  
+- [x] Example harness demos all five verbs (`./scripts/demo.sh`)  
 
 ---
 
