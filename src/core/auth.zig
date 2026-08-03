@@ -138,6 +138,7 @@ pub const Auth = struct {
         if (method == .POST and std.mem.eql(u8, path, "/v1/remember")) return .remember_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/dispute")) return .remember_write;
         if (method == .POST and std.mem.eql(u8, path, "/v1/query")) return .query_read;
+        if (method == .GET and std.mem.eql(u8, path, "/v1/ops/activity")) return .query_read;
         if (method == .GET and std.mem.startsWith(u8, path, "/v1/datasources/")) return .query_read;
         if (method == .GET) return .pipes_read;
         if (method == .POST and std.mem.eql(u8, path, "/v1/mcp")) return .admin;

@@ -221,6 +221,36 @@ paths:
         - { name: run_id, in: query, schema: { type: string } }
       responses:
         "200": { description: Consolidation result }
+  /v1/ops/activity:
+    get:
+      summary: Recent agent ops activity (tool calls, errors, LLM spans, plan steps)
+      description: |
+        Aggregates harness_events by agent_id and returns recent matching events.
+        Requires QUERY:READ (or PIPES:READ / ADMIN) when auth is enabled.
+      parameters:
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+      responses:
+        "200":
+          description: Agents aggregate + recent events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        agent_id: { type: string }
+                        events: { type: integer }
+                        tool_calls: { type: integer }
+                        errors: { type: integer }
+                  events:
+                    type: array
+                    items: { type: object }
   /v1/checkpoint:
     post:
       summary: Snapshot datasource to named checkpoint

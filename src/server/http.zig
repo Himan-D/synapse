@@ -1149,6 +1149,28 @@ fn routeWorkspace(
     if (method == .GET and std.mem.eql(u8, path, "/v1/consolidate")) {
         return runAlias(allocator, request, meta, ws, "consolidate_claims", target, null);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/v1/ops/activity")) {
+        const qmark = std.mem.indexOfScalar(u8, target, '?');
+        const query = if (qmark) |i| target[i + 1 ..] else "";
+        var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer {
+            var pit = params.iterator();
+            while (pit.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            params.deinit(allocator);
+        }
+        try parseQuery(allocator, query, &params);
+        const run_id = params.get("run_id");
+        const agent_id = params.get("agent_id");
+        const limit: usize = if (params.get("limit")) |l| std.fmt.parseInt(usize, l, 10) catch 50 else 50;
+        const json = try ws.opsActivityJson(allocator, run_id, agent_id, limit);
+        defer allocator.free(json);
+        ws.logOp("ops_activity", "harness_events", "ok");
+        try respond(request, meta, json, .ok, "application/json");
+        return;
+    }
     if (method == .POST and std.mem.eql(u8, path, "/v1/checkpoint")) {
         const body = readBody(allocator, request, max_body) catch |err| switch (err) {
             error.StreamTooLong => {

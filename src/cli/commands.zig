@@ -173,6 +173,10 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) !void {
         try runMcpStdio(allocator, io, &ws);
         return;
     }
+    if (std.mem.eql(u8, cmd, "ops")) {
+        try runOps(allocator, io, args);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "dev")) {
         const root = flagOr(args, "--root", ".");
         const port_s = flagOr(args, "--port", "8787");
@@ -604,6 +608,183 @@ fn runCloud(allocator: Allocator, io: Io, args: []const []const u8) !void {
     try http_mod.serveCloud(allocator, io, &hub, .{ .host = host, .port = port, .default_workspace_id = default_ws });
 }
 
+// ── Ops capture ───────────────────────────────────────────────────────────────
+
+fn runOps(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("Usage: synapse ops <init|mcp|status> --root <dir>\n", .{});
+        return error.Usage;
+    }
+    const sub = args[2];
+    const root = flagOr(args, "--root", ".");
+
+    if (std.mem.eql(u8, sub, "init")) {
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const ws_path = try std.fmt.bufPrint(&path_buf, "{s}/workspace.json", .{root});
+        Io.Dir.cwd().access(io, ws_path, .{}) catch {
+            try workspace_mod.initWorkspace(allocator, io, root, "ops-workspace", .{});
+            std.log.info("created workspace at {s}", .{root});
+        };
+        const base_url = flagOr(args, "--base-url", "http://127.0.0.1:8787");
+        try workspace_mod.writeOpsConfig(allocator, io, root, base_url);
+        std.log.info("wrote .synapse/ops.json and .synapse/ops.CURSOR.md", .{});
+        var steps_buf: [1024]u8 = undefined;
+        const steps = try std.fmt.bufPrint(&steps_buf,
+            \\Next steps:
+            \\  1. synapse dev --root {s} --port 8787
+            \\  2. Point Cursor MCP at: synapse ops mcp --root {s}
+            \\     (set SYNAPSE_AGENT_ID / SYNAPSE_RUN_ID in MCP env)
+            \\  3. Or wire afterToolUse hooks — see examples/ops/cursor-hooks.example.json
+            \\  4. synapse ops status --root {s}
+            \\  5. curl '{s}/v1/ops/activity?limit=20'
+            \\
+        , .{ root, root, root, base_url });
+        try printStdoutLine(io, steps);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "mcp")) {
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        try runOpsMcpStdio(allocator, io, &ws);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "status")) {
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const ops_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.json", .{root});
+        const ops_exists = blk: {
+            Io.Dir.cwd().access(io, ops_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        var ws = try workspace_mod.Workspace.load(allocator, io, root);
+        defer ws.deinit();
+        const json = try ws.opsStatusJson(allocator, ops_exists);
+        defer allocator.free(json);
+        try printStdoutLine(io, json);
+        return;
+    }
+
+    std.log.err("unknown ops sub-command: {s}", .{sub});
+    return error.Usage;
+}
+
+fn envOrDefault(comptime key: [:0]const u8, default: []const u8) []const u8 {
+    if (std.c.getenv(key)) |v| return std.mem.span(v);
+    return default;
+}
+
+fn runOpsMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void {
+    const run_id = envOrDefault("SYNAPSE_RUN_ID", "run_ops");
+    const agent_id = envOrDefault("SYNAPSE_AGENT_ID", "agent");
+
+    var stdin_buf: [64 * 1024]u8 = undefined;
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var in_reader = Io.File.stdin().reader(io, &stdin_buf);
+    var out_writer = Io.File.stdout().writer(io, &stdout_buf);
+    const reader = &in_reader.interface;
+
+    while (true) {
+        const first = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        if (first == '{') {
+            const rest = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => |e| return e,
+            };
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try aw.writer.writeByte('{');
+            try aw.writer.writeAll(std.mem.trimEnd(u8, rest, " \t\r"));
+            const body = aw.written();
+            const resp = try handleOpsMcp(allocator, io, ws, body, run_id, agent_id);
+            defer allocator.free(resp);
+            try out_writer.interface.writeAll(resp);
+            try out_writer.interface.writeAll("\n");
+            try out_writer.interface.flush();
+            continue;
+        }
+
+        var header_aw: std.Io.Writer.Allocating = .init(allocator);
+        defer header_aw.deinit();
+        try header_aw.writer.writeByte(first);
+        while (true) {
+            const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => |e| return e,
+            };
+            try header_aw.writer.writeAll(line);
+            try header_aw.writer.writeAll("\n");
+            if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
+        }
+        const headers = header_aw.written();
+        var content_len: ?usize = null;
+        var hit = std.mem.splitScalar(u8, headers, '\n');
+        while (hit.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
+                const v = std.mem.trim(u8, line["Content-Length:".len..], " \t");
+                content_len = std.fmt.parseInt(usize, v, 10) catch null;
+            }
+        }
+        const n = content_len orelse continue;
+        const body = try allocator.alloc(u8, n);
+        defer allocator.free(body);
+        try reader.readSliceAll(body);
+        const resp = try handleOpsMcp(allocator, io, ws, body, run_id, agent_id);
+        defer allocator.free(resp);
+        try out_writer.interface.print("Content-Length: {d}\r\n\r\n", .{resp.len});
+        try out_writer.interface.writeAll(resp);
+        try out_writer.interface.flush();
+    }
+}
+
+fn handleOpsMcp(
+    allocator: Allocator,
+    io: Io,
+    ws: *workspace_mod.Workspace,
+    body: []const u8,
+    run_id: []const u8,
+    agent_id: []const u8,
+) ![]u8 {
+    var tool_name: ?[]const u8 = null;
+    var is_tool_call = false;
+
+    if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            const method = if (parsed.value.object.get("method")) |m| m.string else "";
+            if (std.mem.eql(u8, method, "tools/call")) {
+                is_tool_call = true;
+                if (parsed.value.object.get("params")) |params| {
+                    if (params.object.get("name")) |n| tool_name = n.string;
+                }
+            }
+        }
+    } else |_| {}
+
+    const t0 = Io.Clock.real.now(io).toNanoseconds();
+    const resp = mcp_mod.handle(allocator, ws, body) catch |err| return err;
+    const elapsed_ms: u64 = @intCast(@divTrunc(Io.Clock.real.now(io).toNanoseconds() - t0, 1_000_000));
+
+    if (is_tool_call) {
+        const name = tool_name orelse "unknown";
+        const ok = blk: {
+            if (std.json.parseFromSlice(std.json.Value, allocator, resp, .{})) |p| {
+                defer p.deinit();
+                if (p.value.object.get("error") != null) break :blk false;
+                break :blk true;
+            } else |_| break :blk false;
+        };
+        ws.recordOpsToolCall(run_id, agent_id, name, ok, elapsed_ms) catch {};
+    }
+
+    return resp;
+}
+
 // ── MCP stdio ────────────────────────────────────────────────────────────────
 
 fn runMcpStdio(allocator: Allocator, io: Io, ws: *workspace_mod.Workspace) !void {
@@ -835,6 +1016,7 @@ fn printHelp() !void {
         \\  synapse graph --root <dir> --run-id <id>
         \\  synapse deploy --root <dir>
         \\  synapse mcp --root <dir>
+        \\  synapse ops init|mcp|status --root <dir>
         \\  synapse dev --root <dir> --port <port> [--host 127.0.0.1]
         \\  synapse ingest <datasource> <file.ndjson> --root <dir> [--replace]
         \\  synapse remember "<text>" --root <dir> --run-id <id> [--confidence 0.9]
@@ -863,6 +1045,7 @@ fn printHelp() !void {
         \\  PORT                    port for cloud mode (Render compatible)
         \\
         \\Playground: open http://127.0.0.1:8787/ while `synapse dev` is running.
+        \\Ops capture: see docs/OPS.md (`synapse ops init --root .`).
         \\See docs/CLOUD.md, docs/PRODUCTION_PLAN.md, docs/openapi.yaml.
         \\
     ;

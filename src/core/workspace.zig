@@ -8,6 +8,7 @@ const auth_mod = @import("auth.zig");
 const graph_mod = @import("graph.zig");
 const diff_mod = @import("diff.zig");
 const workflow_mod = @import("workflow.zig");
+const event_mod = @import("event.zig");
 
 pub const Workspace = struct {
     allocator: Allocator,
@@ -439,6 +440,138 @@ pub const Workspace = struct {
         return workflow_mod.tickRun(self.allocator, self.io, self.root, run_id, self.actionCtx());
     }
 
+    /// Record a tool_call harness event for ops capture (MCP wrapper, hooks, SDK).
+    pub fn recordOpsToolCall(
+        self: *Workspace,
+        run_id: []const u8,
+        agent_id: []const u8,
+        tool_name: []const u8,
+        ok: bool,
+        latency_ms: u64,
+    ) !void {
+        const ts = try formatUtcNow(self.allocator, self.io);
+        defer self.allocator.free(ts);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.print(
+            \\{{"ts":{f},"run_id":{f},"agent_id":{f},"type":"tool_call","payload":{{"name":{f},"ok":{s},"latency_ms":{d}}}}}
+            \\
+        ,
+            .{
+                std.json.fmt(ts, .{}),
+                std.json.fmt(run_id, .{}),
+                std.json.fmt(agent_id, .{}),
+                std.json.fmt(tool_name, .{}),
+                if (ok) "true" else "false",
+                latency_ms,
+            },
+        );
+        _ = try self.store.ingestNdjson("harness_events", aw.written());
+    }
+
+    /// Aggregate recent ops activity from harness_events for GET /v1/ops/activity.
+    pub fn opsActivityJson(
+        self: *Workspace,
+        allocator: Allocator,
+        run_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        limit: usize,
+    ) ![]u8 {
+        const lim = @min(if (limit == 0) 50 else limit, 500);
+        const evs = self.store.events("harness_events");
+
+        var agent_counts: std.StringHashMapUnmanaged(struct { total: u32, tool_calls: u32, errors: u32 }) = .empty;
+        defer {
+            var ait = agent_counts.iterator();
+            while (ait.next()) |e| allocator.free(e.key_ptr.*);
+            agent_counts.deinit(allocator);
+        }
+
+        var matched: std.ArrayList(event_mod.Event) = .empty;
+        defer matched.deinit(allocator);
+
+        for (evs) |ev| {
+            if (!opsEventType(ev.type_raw)) continue;
+            if (run_id) |rid| if (!std.mem.eql(u8, ev.run_id, rid)) continue;
+            if (agent_id) |aid| if (!std.mem.eql(u8, ev.agent_id, aid)) continue;
+
+            const key = try allocator.dupe(u8, ev.agent_id);
+            const gop = try agent_counts.getOrPut(allocator, key);
+            if (gop.found_existing) allocator.free(key);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .total = 0, .tool_calls = 0, .errors = 0 };
+            gop.value_ptr.total += 1;
+            if (std.mem.eql(u8, ev.type_raw, "tool_call")) gop.value_ptr.tool_calls += 1;
+            if (std.mem.eql(u8, ev.type_raw, "error")) gop.value_ptr.errors += 1;
+
+            try matched.append(allocator, ev);
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.writeAll("{\"agents\":[");
+        var first = true;
+        var ait = agent_counts.iterator();
+        while (ait.next()) |e| {
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print(
+                \\{{"agent_id":{f},"events":{d},"tool_calls":{d},"errors":{d}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), e.value_ptr.total, e.value_ptr.tool_calls, e.value_ptr.errors },
+            );
+        }
+        try aw.writer.writeAll("],\"events\":[");
+        first = true;
+        var shown: usize = 0;
+        var i: isize = @intCast(matched.items.len);
+        while (i > 0 and shown < lim) : (i -= 1) {
+            const ev = matched.items[@intCast(i - 1)];
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.writeAll(ev.raw_json);
+            shown += 1;
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
+    /// CLI ops status: config presence + per-agent event counts.
+    pub fn opsStatusJson(self: *Workspace, allocator: Allocator, ops_config_exists: bool) ![]u8 {
+        const evs = self.store.events("harness_events");
+        var agent_counts: std.StringHashMapUnmanaged(u32) = .empty;
+        defer {
+            var ait = agent_counts.iterator();
+            while (ait.next()) |e| allocator.free(e.key_ptr.*);
+            agent_counts.deinit(allocator);
+        }
+        for (evs) |ev| {
+            if (!opsEventType(ev.type_raw)) continue;
+            const key = try allocator.dupe(u8, ev.agent_id);
+            const gop = try agent_counts.getOrPut(allocator, key);
+            if (gop.found_existing) allocator.free(key);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        try aw.writer.print("{{\"ops_config\":{s},\"datasource\":\"harness_events\",\"agents\":[", .{
+            if (ops_config_exists) "true" else "false",
+        });
+        var first = true;
+        var ait = agent_counts.iterator();
+        while (ait.next()) |e| {
+            if (!first) try aw.writer.writeAll(",");
+            first = false;
+            try aw.writer.print(
+                \\{{"agent_id":{f},"count":{d}}}
+            ,
+                .{ std.json.fmt(e.key_ptr.*, .{}), e.value_ptr.* },
+            );
+        }
+        try aw.writer.writeAll("]}");
+        return try aw.toOwnedSlice();
+    }
+
     pub fn createBranch(self: *Workspace, name: []const u8) ![]u8 {
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const src = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/data", .{self.root});
@@ -469,6 +602,97 @@ pub const Workspace = struct {
         });
     }
 };
+
+fn opsEventType(type_raw: []const u8) bool {
+    return std.mem.eql(u8, type_raw, "tool_call") or
+        std.mem.eql(u8, type_raw, "error") or
+        std.mem.eql(u8, type_raw, "llm_span") or
+        std.mem.eql(u8, type_raw, "plan_step");
+}
+
+pub fn writeOpsConfig(allocator: Allocator, io: Io, root: []const u8, base_url: []const u8) !void {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const syn_dir = try std.fmt.bufPrint(&path_buf, "{s}/.synapse", .{root});
+    try Io.Dir.cwd().createDirPath(io, syn_dir);
+    const ops_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.json", .{root});
+    const body =
+        \\{{
+        \\  "version": 1,
+        \\  "datasource": "harness_events",
+        \\  "base_url": "{s}",
+        \\  "capture": ["tool_call", "error", "llm_span", "plan_step"],
+        \\  "identity": {{
+        \\    "agent_id_env": "SYNAPSE_AGENT_ID",
+        \\    "run_id_env": "SYNAPSE_RUN_ID"
+        \\  }}
+        \\}}
+        \\
+    ;
+    var cfg_buf: [512]u8 = undefined;
+    const cfg = try std.fmt.bufPrint(&cfg_buf, body, .{base_url});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ops_path, .data = cfg });
+
+    const cursor_path = try std.fmt.bufPrint(&path_buf, "{s}/.synapse/ops.CURSOR.md", .{root});
+    var md_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer md_aw.deinit();
+    try md_aw.writer.writeAll(
+        \\# Synapse ops capture (Cursor)
+        \\
+        \\Synapse records **what you wire in** — tool calls, errors, LLM spans, plan steps.
+        \\It is not IDE spyware: nothing is captured unless you point hooks or MCP at Synapse.
+        \\
+        \\## Option A — MCP (recommended)
+        \\
+        \\Add to Cursor MCP settings (stdio):
+        \\
+        \\```json
+        \\{
+        \\  "mcpServers": {
+        \\    "synapse-ops": {
+        \\      "command": "/path/to/synapse",
+        \\      "args": ["ops", "mcp", "--root", "
+    );
+    try md_aw.writer.writeAll(root);
+    try md_aw.writer.writeAll(
+        \\"],
+        \\      "env": {
+        \\        "SYNAPSE_AGENT_ID": "cursor",
+        \\        "SYNAPSE_RUN_ID": "my-run"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\```
+        \\
+        \\Every `tools/call` through this MCP server is logged to `harness_events`.
+        \\
+        \\## Option B — afterToolUse hook
+        \\
+        \\See `examples/ops/cursor-hooks.example.json`. POST NDJSON to:
+        \\
+    );
+    try md_aw.writer.writeAll(base_url);
+    try md_aw.writer.writeAll(
+        \\/v1/events/harness_events
+        \\
+        \\## Query activity
+        \\
+        \\```bash
+        \\curl '
+    );
+    try md_aw.writer.writeAll(base_url);
+    try md_aw.writer.writeAll(
+        \\/v1/ops/activity?limit=20'
+        \\synapse ops status --root 
+    );
+    try md_aw.writer.writeAll(root);
+    try md_aw.writer.writeAll(
+        \\
+        \\```
+        \\
+    );
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = cursor_path, .data = md_aw.written() });
+}
 
 fn formatUtcNow(allocator: Allocator, io: Io) ![]u8 {
     const secs_i = Io.Clock.real.now(io).toSeconds();
@@ -684,4 +908,27 @@ fn writeDefaultPipes(io: Io, root: []const u8) !void {
         const path = try std.fmt.bufPrint(&path_buf, "{s}/pipes/{s}", .{ root, f[0] });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f[1] });
     }
+}
+
+test "ops tool call and activity json" {
+    const io = std.testing.io;
+    const tmp = "zig-cache/synapse-ops-test";
+    Io.Dir.cwd().createDirPath(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    try initWorkspace(std.testing.allocator, io, tmp, "ops-test", .{});
+
+    var ws = try Workspace.load(std.testing.allocator, io, tmp);
+    defer ws.deinit();
+
+    try ws.recordOpsToolCall("run_ops", "agent_a", "grep", true, 12);
+    try ws.recordOpsToolCall("run_ops", "agent_a", "read", false, 3);
+    try ws.recordOpsToolCall("run_ops", "agent_b", "plan", true, 50);
+
+    const json = try ws.opsActivityJson(std.testing.allocator, "run_ops", null, 10);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "agent_a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "grep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\":1") != null or
+        std.mem.indexOf(u8, json, "\"tool_calls\":2") != null);
 }

@@ -82,6 +82,7 @@ curl -s -X POST 'http://127.0.0.1:8787/v1/remember' \
 | `synapse endpoint --root <dir>` | List published endpoints |
 | `synapse token show\|create [name]` | Admin / scoped tokens |
 | `synapse mcp --root <dir>` | MCP over stdio (Cursor / Claude Desktop) |
+| `synapse ops init\|mcp\|status --root <dir>` | Drop-in agent ops capture (see [docs/OPS.md](docs/OPS.md)) |
 | `synapse branch create <name>` | Snapshot local event data |
 | `synapse workflow list\|start\|signal\|tick…` | Durable workflows (Temporal/Inngest-shaped) |
 | `synapse graph --run-id <id>` | Inspect World/Work/Mind |
@@ -119,6 +120,19 @@ Default pipes:
 | `tool_failure_rate` | `/v1/metrics/tool_failure_rate` | Aggregate failure rates |
 | `blast_radius` | `/v1/impact` | Work/World impact |
 | `find_contradictions` | `/v1/dispute` | Opposing Mind claims |
+
+## Ops: who did what
+
+Drop-in **agent ops capture** for any repo — log tool calls, errors, LLM spans, and plan steps into `harness_events` via MCP, IDE hooks, or SDK decorators.
+
+```bash
+./zig-out/bin/synapse ops init --root .
+./zig-out/bin/synapse dev --root . --port 8787
+# MCP: synapse ops mcp --root .  (set SYNAPSE_AGENT_ID / SYNAPSE_RUN_ID)
+curl 'http://127.0.0.1:8787/v1/ops/activity?limit=20'
+```
+
+**Not magic IDE spyware** — nothing is captured unless you wire hooks or MCP. Full guide: [docs/OPS.md](docs/OPS.md).
 
 Auth is opt-in in local mode: set `SYNAPSE_REQUIRE_AUTH=1` to require `Authorization: Bearer <token>` (or `?token=`) from `.synapse/token`. Scopes are `ADMIN`, `PIPES:READ`, `EVENTS:WRITE`, `REMEMBER:WRITE`, `QUERY:READ` — that is the complete set. `401` means no or unknown token; `403` means a real token without the right scope. See [SECURITY.md](SECURITY.md).  
 Bind host via `--host` / `SYNAPSE_HOST` (default loopback; non-loopback without auth logs a warning in `dev` and is refused outright by `cloud serve`).  

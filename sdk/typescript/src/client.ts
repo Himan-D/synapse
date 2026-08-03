@@ -100,4 +100,80 @@ export class Synapse {
       body: JSON.stringify({ datasource, where, limit, offset }),
     });
   }
+  ingest(datasource: string, events: Record<string, unknown>[]) {
+    const body = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    return this.request("POST", `/v1/events/${datasource}`, {
+      contentType: "application/x-ndjson",
+      body,
+    });
+  }
+  activity(opts: { runId?: string; agentId?: string; limit?: number } = {}) {
+    return this.request("GET", "/v1/ops/activity", {
+      query: { run_id: opts.runId, agent_id: opts.agentId, limit: opts.limit },
+    });
+  }
+  wrapTool<T extends (...args: never[]) => unknown>(
+    name: string,
+    fn: T,
+    opts: { runId: string; agentId?: string; datasource?: string },
+  ): T {
+    const agentId = opts.agentId ?? "agent";
+    const ds = opts.datasource ?? "harness_events";
+    const wrapped = ((...args: Parameters<T>) => {
+      const t0 = Date.now();
+      let ok = true;
+      let err: string | undefined;
+      try {
+        const out = fn(...args);
+        if (out instanceof Promise) {
+          return out
+            .catch((e: unknown) => {
+              ok = false;
+              err = e instanceof Error ? e.message : String(e);
+              throw e;
+            })
+            .finally(() => {
+              const ms = Date.now() - t0;
+              const payload: Record<string, unknown> = { name, ok, latency_ms: ms };
+              if (err) payload.error = err;
+              void this.ingest(ds, [
+                {
+                  ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+                  run_id: opts.runId,
+                  agent_id: agentId,
+                  type: "tool_call",
+                  payload,
+                },
+              ]).catch(() => {});
+            }) as ReturnType<T>;
+        }
+        const ms = Date.now() - t0;
+        void this.ingest(ds, [
+          {
+            ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+            run_id: opts.runId,
+            agent_id: agentId,
+            type: "tool_call",
+            payload: { name, ok: true, latency_ms: ms },
+          },
+        ]).catch(() => {});
+        return out;
+      } catch (e) {
+        ok = false;
+        err = e instanceof Error ? e.message : String(e);
+        const ms = Date.now() - t0;
+        void this.ingest(ds, [
+          {
+            ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+            run_id: opts.runId,
+            agent_id: agentId,
+            type: "tool_call",
+            payload: { name, ok, latency_ms: ms, error: err },
+          },
+        ]).catch(() => {});
+        throw e;
+      }
+    }) as T;
+    return wrapped;
+  }
 }

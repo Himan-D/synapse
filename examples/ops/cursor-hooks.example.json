@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "afterToolUse": [
+      {
+        "description": "POST tool_call NDJSON to local Synapse (adjust base_url and paths)",
+        "command": "sh -c 'TS=$(date -u +%Y-%m-%dT%H:%M:%SZ); RUN=${SYNAPSE_RUN_ID:-run_ops}; AGENT=${SYNAPSE_AGENT_ID:-cursor}; TOOL=\"$CURSOR_TOOL_NAME\"; OK=true; curl -sf -X POST \"http://127.0.0.1:8787/v1/events/harness_events\" -H \"content-type: application/x-ndjson\" --data-binary \"{\\\"ts\\\":\\\"$TS\\\",\\\"run_id\\\":\\\"$RUN\\\",\\\"agent_id\\\":\\\"$AGENT\\\",\\\"type\\\":\\\"tool_call\\\",\\\"payload\\\":{\\\"name\\\":\\\"$TOOL\\\",\\\"ok\\\":$OK}}\\n\" || true'"
+      }
+    ]
+  },
+  "_notes": [
+    "Cursor hook env var names vary by version — substitute the tool name from your hook payload.",
+    "Prefer synapse ops mcp when you can: it captures every MCP tools/call automatically.",
+    "See docs/OPS.md for Python @tool_call decorator and TypeScript wrapTool()."
+  ]
+}
